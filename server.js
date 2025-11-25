@@ -13,12 +13,16 @@ const TDX_CLIENT_SECRET = process.env.TDX_CLIENT_SECRET || '';
 // --- 記憶體快取 ---
 let globalCache = {
   success: false,
-  message: "系統初始化中...",
-  data: [], // 這裡存放算出來的「即時」顯示資料
-  rawSchedule: [], // 這裡存放下載回來的「整日時刻表」
+  message: "系統啟動中...",
+  data: [], // 顯示給 App 的即時資料
+  rawSchedule: [], // 完整的時刻表資料庫
   lastUpdated: null,
-  rawError: null
+  rawError: null,
+  downloadProgress: "等待開始..."
 };
+
+// --- 輔助函式：延遲 ---
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- 1. 取得 Token ---
 let authToken = null;
@@ -48,115 +52,143 @@ async function getAuthToken() {
   }
 }
 
-// --- 2. 核心功能：下載整日時刻表 ---
-// 這個函式只需要執行一次 (或每小時更新一次)
+// --- 2. 核心功能：螞蟻搬家式下載時刻表 ---
+const LINES = ['BL', 'R', 'G', 'O', 'BR', 'Y']; 
+
 async function fetchDailyTimetable() {
   if (!authToken) {
     const success = await getAuthToken();
     if (!success) return;
   }
 
-  try {
-    console.log(`📥 [${new Date().toLocaleTimeString()}] 開始下載全線時刻表...`);
-    
-    // 改用 StationTimeTable (車站時刻表) API
-    // 這裡我們一口氣抓 5000 筆，把所有車站的班表都拿回來
-    const response = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/StationTimeTable/TRTC', {
-      headers: { 'Authorization': `Bearer ${authToken}`, 'Accept': 'application/json' },
-      params: { '$top': 5000, '$format': 'JSON' }
-    });
+  console.log(`📥 [${new Date().toLocaleTimeString()}] 開始分線下載時刻表...`);
+  let accumulatedData = [];
+  let hasError = false;
 
-    if (response.data && Array.isArray(response.data)) {
-      globalCache.rawSchedule = response.data;
-      console.log(`📦 時刻表下載完成！共 ${response.data.length} 個車站/方向資料`);
+  for (const lineId of LINES) {
+    try {
+      globalCache.downloadProgress = `正在下載 ${lineId} 線...`;
+      console.log(`.. 下載 ${lineId} 線中`);
+
+      const response = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/StationTimeTable/TRTC', {
+        headers: { 'Authorization': `Bearer ${authToken}`, 'Accept': 'application/json' },
+        params: { 
+            '$filter': `LineNo eq '${lineId}'`, // 只抓這條線
+            '$top': 2000, // 夠大，確保不分頁
+            '$format': 'JSON' 
+        }
+      });
+
+      if (response.data && Array.isArray(response.data)) {
+        accumulatedData = accumulatedData.concat(response.data);
+      }
+
+      // [關鍵] 每抓完一條線，強制休息 3 秒，讓 TDX 覺得我們很友善
+      await delay(3000);
+
+    } catch (error) {
+      console.error(`❌ 下載 ${lineId} 失敗:`, error.message);
+      hasError = true;
       
-      // 下載完馬上計算一次
-      calculateNextTrains();
+      // 遇到 429 (被封鎖)，休息更久 (10秒) 再試下一條
+      if (error.response && error.response.status === 429) {
+          console.warn('⚠️ 觸發 429，進入冷卻模式 (10s)...');
+          await delay(10000);
+      }
+      
+      if (error.response && error.response.status === 401) {
+          authToken = null;
+          await getAuthToken();
+      }
     }
-  } catch (error) {
-    console.error('❌ 時刻表下載失敗:', error.message);
-    globalCache.rawError = error.message;
+  }
+
+  if (accumulatedData.length > 0) {
+    globalCache.rawSchedule = accumulatedData;
+    globalCache.downloadProgress = "下載完成";
+    console.log(`📦 全線時刻表下載完成！共 ${accumulatedData.length} 筆車站資料`);
     
-    // 如果是 Token 問題就重抓
-    if (error.response && error.response.status === 401) {
-      authToken = null;
-      await getAuthToken();
-    }
+    // 馬上計算一次
+    calculateNextTrains();
+  } else {
+    globalCache.downloadProgress = "下載失敗，將重試";
+    console.log('⚠️ 本次未能下載任何資料，稍後重試');
   }
 }
 
-// --- 3. 核心運算：計算下一班車 (不需聯網) ---
-// 這個函式會每 10 秒跑一次，純 CPU 運算，完全不消耗 API 額度
+// --- 3. 核心運算：計算下一班車 (純 CPU 運算) ---
 function calculateNextTrains() {
   if (globalCache.rawSchedule.length === 0) return;
 
   const now = new Date();
-  // 取得目前時間的「分鐘數」 (例如 14:30 = 14*60 + 30 = 870)
-  // 注意：需處理跨日問題 (TDX 00:00 可能算隔天)
-  // 這裡為了簡化，我們用本地時間字串比對 'HH:mm'
-  const currentHour = now.getHours();
-  const currentMin = now.getMinutes();
+  // 調整為台灣時間 (Render 伺服器通常是 UTC)
+  // 簡單處理：我們直接用伺服器時間 + 8小時來計算「現在幾點」
+  // 但為了避免時區混亂，我們用比較穩妥的方式：
+  // 獲取當前的 UTC 時間，然後加 8 小時轉成台灣時間
+  const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+  const twTime = new Date(utc + (3600000 * 8));
+  
+  const currentHour = twTime.getHours();
+  const currentMin = twTime.getMinutes();
   const currentTimeValue = currentHour * 60 + currentMin;
 
   let liveBoardData = [];
 
-  // 遍歷每一個車站的時刻表
   globalCache.rawSchedule.forEach(station => {
-    // station.Timetables 包含了該站整天的班次
     if (!station.Timetables || !Array.isArray(station.Timetables)) return;
 
-    // 找到「第一班」時間晚於「現在」的車
-    // Timetables 通常已經照時間排序好了
+    // 找到下一班車
     const nextTrain = station.Timetables.find(t => {
-        // t.ArrivalTime 格式為 "HH:mm" 或 "HH:mm:ss"
         const [h, m] = t.ArrivalTime.split(':').map(Number);
         const trainTimeValue = h * 60 + m;
-        
-        // 簡單邏輯：只要時間比現在晚，就是下一班
-        // (這裡尚未處理半夜 00:00 跨日的情況，但在營運時間內是準的)
         return trainTimeValue > currentTimeValue;
     });
 
     if (nextTrain) {
-      // 計算還有幾分鐘
       const [h, m] = nextTrain.ArrivalTime.split(':').map(Number);
       const trainTimeValue = h * 60 + m;
       let diffMinutes = trainTimeValue - currentTimeValue;
       
-      // 為了符合前端格式，我們組裝出一樣的物件
       liveBoardData.push({
         stationID: station.StationID,
         stationName: station.StationName.Zh_tw,
         destination: station.DestinationStationName.Zh_tw,
-        time: diffMinutes, // 這裡直接給分鐘數
-        lineNo: station.LineNo || 'Unkown', // 時刻表有時候沒給 LineNo，沒關係
-        crowdLevel: 'LOW' // 時刻表沒有擁擠度，預設 LOW
+        time: diffMinutes, 
+        lineNo: station.LineNo || 'Unkown', 
+        crowdLevel: 'LOW' 
       });
     }
   });
 
   globalCache.data = liveBoardData;
-  globalCache.lastUpdated = new Date();
+  globalCache.lastUpdated = new Date(); // 更新時間
   globalCache.success = true;
   globalCache.message = "時刻表運算正常";
   
-  console.log(`🧮 [${new Date().toLocaleTimeString()}] 運算完成：全線即時更新 (${liveBoardData.length} 班列車)`);
+  // Log 不要太頻繁，這裡註解掉
+  // console.log(`🧮 運算完成 (${liveBoardData.length} 班列車)`);
 }
 
 // --- 排程設定 ---
-// 1. 啟動時下載一次時刻表
+
+// 1. 啟動時執行下載
 fetchDailyTimetable();
 
-// 2. 每 1 小時重新下載一次時刻表 (確保隔天或臨時變動)
-setInterval(fetchDailyTimetable, 60 * 60 * 1000);
+// 2. 每 4 小時重新下載一次時刻表 (因為時刻表不太會變，不需要頻繁抓)
+setInterval(fetchDailyTimetable, 4 * 60 * 60 * 1000);
 
-// 3. 每 10 秒「內部運算」一次倒數時間 (這不是請求 API，是內部 CPU 算)
+// 3. 每 10 秒計算一次倒數 (純 CPU)
 setInterval(calculateNextTrains, 10000);
 
 
 // --- 路由 ---
 app.get('/', (req, res) => {
-  res.send(`<h1>TDX Timetable Engine</h1><p>Calculated Trains: ${globalCache.data.length}</p>`);
+  res.send(`
+    <h1>TDX Timetable Engine (Slow Fetch)</h1>
+    <p>Progress: ${globalCache.downloadProgress}</p>
+    <p>Calculated Trains: ${globalCache.data.length}</p>
+    <p>Last Calculation: ${globalCache.lastUpdated?.toLocaleString()}</p>
+  `);
 });
 
 app.get('/api/trains', (req, res) => {
@@ -174,8 +206,8 @@ app.get('/api/debug', (req, res) => {
       success: globalCache.success,
       message: globalCache.message,
       dataCount: globalCache.data.length,
-      lastUpdated: globalCache.lastUpdated,
-      scheduleSize: globalCache.rawSchedule.length // 顯示下載了多少個車站的班表
+      scheduleSize: globalCache.rawSchedule.length,
+      downloadProgress: globalCache.downloadProgress
     },
     lastError: globalCache.rawError
   });
