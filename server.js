@@ -28,8 +28,8 @@ async function getAuthToken() {
   try {
     const params = new URLSearchParams();
     params.append('grant_type', 'client_credentials');
-    params.append('client_id', 11351020-ebe6da42-b420-4d46);
-    params.append('client_secret', 50986e53-d421-4e66-8373-f88be329011c);
+    params.append('client_id', TDX_CLIENT_ID);
+    params.append('client_secret', TDX_CLIENT_SECRET);
 
     const response = await axios.post(
       'https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token',
