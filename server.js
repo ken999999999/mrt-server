@@ -52,7 +52,7 @@ async function getAuthToken() {
   }
 }
 
-// --- 2. 抓取資料 (修正回 LiveBoard) ---
+// --- 2. 抓取資料 (修正：加上 $top=3000 參數) ---
 async function fetchTDXData() {
   if (!authToken) {
     const success = await getAuthToken();
@@ -60,8 +60,9 @@ async function fetchTDXData() {
   }
 
   try {
-    // 修正：改回 LiveBoard (站牌顯示看板)，這是台北捷運唯一正確的即時資料來源
-    const url = 'https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/LiveBoard/TRTC?%24format=JSON';
+    // [關鍵修正] 根據您提供的圖片，我們加上 $top=3000 參數
+    // 這會告訴 TDX 不要分頁，直接給我們最多 3000 筆資料 (足夠涵蓋全線列車)
+    const url = 'https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/LiveBoard/TRTC?%24top=3000&%24format=JSON';
     
     const response = await axios.get(url, {
       headers: { 
@@ -72,10 +73,10 @@ async function fetchTDXData() {
 
     const rawData = response.data;
 
-    // --- 資料轉換邏輯 (加強防呆) ---
+    // --- 資料轉換邏輯 ---
     const processedData = rawData.map(item => ({
       stationID: item.StationID,
-      // 使用 ?. 運算子，如果沒有中文名就回傳空字串，避免崩潰
+      // 使用 ?. 運算子，如果沒有中文名就回傳空字串
       stationName: item.StationName?.Zh_tw || item.StationID || '未知站名',
       destination: item.DestinationName?.Zh_tw || '未知目的地',
       time: item.EstimateTime || 0, 
@@ -88,7 +89,7 @@ async function fetchTDXData() {
     globalCache.message = "資料更新正常";
     globalCache.rawError = null;
     
-    console.log(`🔄 [${new Date().toLocaleTimeString()}] LiveBoard 更新成功: ${processedData.length} 筆資料`);
+    console.log(`🔄 [${new Date().toLocaleTimeString()}] LiveBoard 更新成功: 抓到 ${processedData.length} 筆資料`);
 
   } catch (error) {
     const status = error.response ? error.response.status : 'Unknown';
@@ -113,7 +114,7 @@ app.get('/', (req, res) => {
   res.send(`
     <h1>TDX Server (LiveBoard)</h1>
     <p>Status: ${globalCache.success ? '🟢 Online' : '🔴 Error'}</p>
-    <p>Data Count: ${globalCache.data.length}</p>
+    <p>Data Count: ${globalCache.data.length} (應該要大於 18)</p>
     <p>Last Update: ${globalCache.lastUpdated?.toLocaleString()}</p>
     <p><a href="/api/debug">Debug Info</a></p>
   `);
