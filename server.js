@@ -10,12 +10,14 @@ const PORT = process.env.PORT || 3000;
 const TDX_CLIENT_ID = process.env.TDX_CLIENT_ID || '';
 const TDX_CLIENT_SECRET = process.env.TDX_CLIENT_SECRET || '';
 
+// --- 記憶體快取 ---
 let globalCache = {
   success: false,
   message: "初始化中...",
   data: [],
   lastUpdated: null,
-  rawError: null 
+  rawError: null,
+  debugInfo: [] // 用來記錄每一條線抓到幾筆
 };
 
 // --- 1. 取得 Token ---
@@ -49,80 +51,102 @@ async function getAuthToken() {
   }
 }
 
-// --- 2. 抓取資料 (單次超級請求) ---
+// --- 輔助函式：延遲 (避免 429) ---
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- 2. 抓取資料 (慢速排隊模式) ---
+// 台北捷運路線代號
+const LINES = ['BL', 'R', 'G', 'O', 'BR', 'Y']; 
+
 async function fetchTDXData() {
   if (!authToken) {
     const success = await getAuthToken();
     if (!success) return;
   }
 
-  try {
-    console.log(`🔄 [${new Date().toLocaleTimeString()}] 發送單次請求抓取全線資料...`);
+  let allData = [];
+  let lineStats = []; // 記錄每條線抓到的狀況
+  let hasError = false;
 
-    // [戰術修正] 不再分路線抓，直接抓 TRTC (台北捷運) 全部
-    // 關鍵是 $top=3000，確保不分頁，一次拿回所有車次
-    const response = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/LiveBoard/TRTC', {
-      headers: { 
-        'Authorization': `Bearer ${authToken}`,
-        'Accept': 'application/json'
-      },
-      params: {
-        '$top': 3000,  // 一次抓 3000 筆，絕對夠涵蓋所有列車
-        '$format': 'JSON'
+  console.log(`🔄 [${new Date().toLocaleTimeString()}] 開始慢速抓取全線資料...`);
+
+  for (const lineId of LINES) {
+    try {
+      const response = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/LiveBoard/TRTC', {
+        headers: { 
+          'Authorization': `Bearer ${authToken}`,
+          'Accept': 'application/json'
+        },
+        params: {
+          '$filter': `LineNo eq '${lineId}'`, 
+          '$top': 1000, // 確保每條線都抓完整
+          '$format': 'JSON'
+        }
+      });
+
+      const count = response.data?.length || 0;
+      lineStats.push({ line: lineId, count: count });
+      
+      if (response.data && Array.isArray(response.data)) {
+        allData = allData.concat(response.data);
       }
-    });
+      
+      // [關鍵] 休息 1500 毫秒 (1.5秒)，這對 API 來說非常友善，不會觸發封鎖
+      await delay(1500);
 
-    const rawData = response.data;
-
-    if (rawData && Array.isArray(rawData)) {
-        const processedData = rawData.map(item => ({
-          stationID: item.StationID,
-          // 根據您的截圖，StationName 是物件
-          stationName: item.StationName?.Zh_tw || item.StationID || '未知',
-          // 根據您的截圖，DestinationStationName 也是物件
-          destination: item.DestinationStationName?.Zh_tw || item.DestinationStationID || '未知',
-          time: item.EstimateTime || 0, 
-          lineNo: item.LineNo,
-          crowdLevel: 'LOW' 
-        }));
-
-        globalCache.data = processedData;
-        globalCache.lastUpdated = new Date();
-        globalCache.success = true;
-        globalCache.message = "資料更新正常";
-        globalCache.rawError = null;
-        
-        console.log(`✅ 更新成功: 抓到 ${processedData.length} 筆資料 (單次請求)`);
-    } else {
-        console.warn('⚠️ API 回傳格式非陣列:', rawData);
+    } catch (error) {
+      console.error(`❌ 抓取路線 ${lineId} 失敗:`, error.message);
+      lineStats.push({ line: lineId, count: 0, error: error.message });
+      
+      // 如果遇到 429，休息久一點 (5秒)
+      if (error.response && error.response.status === 429) {
+         console.warn('⚠️ 觸發 429，暫停 5 秒...');
+         await delay(5000);
+      }
+      
+      if (error.response && error.response.status === 401) {
+         authToken = null;
+         await getAuthToken();
+      }
     }
+  }
 
-  } catch (error) {
-    console.error(`❌ 抓取失敗:`, error.message);
+  // 整合資料
+  if (allData.length > 0) {
+    const processedData = allData.map(item => ({
+      stationID: item.StationID,
+      stationName: item.StationName?.Zh_tw || item.StationID || '未知',
+      destination: item.DestinationStationName?.Zh_tw || item.DestinationStationID || '未知',
+      time: item.EstimateTime || 0, 
+      lineNo: item.LineNo,
+      crowdLevel: 'LOW' 
+    }));
+
+    globalCache.data = processedData;
+    globalCache.lastUpdated = new Date();
+    globalCache.success = true;
+    globalCache.message = `更新成功 (共 ${processedData.length} 筆)`;
+    globalCache.debugInfo = lineStats; // 存下每條線的統計
+    globalCache.rawError = null;
     
-    // 429 處理：如果還是太快，記錄錯誤但不崩潰
-    if (error.response && error.response.status === 429) {
-        globalCache.rawError = { message: "429 Too Many Requests", detail: "請求過於頻繁，請稍候" };
-    } else {
-        globalCache.rawError = error.response ? error.response.data : error.message;
-    }
-
-    // Token 過期處理
-    if (error.response && error.response.status === 401) {
-      authToken = null;
-      await getAuthToken();
-    }
+    console.log(`✅ 完成！統計: ${JSON.stringify(lineStats)}`);
+  } else {
+    console.log('⚠️ 本次循環未抓到任何資料');
   }
 }
 
 // --- 3. 設定排程 ---
 fetchTDXData();
-// 設定為 60 秒更新一次，這對免費額度來說是最安全的頻率
+// 設定為 60 秒更新一次，給予伺服器充足的緩衝時間
 setInterval(fetchTDXData, 60000); 
 
 // --- 4. 路由 ---
 app.get('/', (req, res) => {
-  res.send(`<h1>TDX Server (Single Request Mode)</h1><p>Data Count: ${globalCache.data.length}</p>`);
+  res.send(`
+    <h1>TDX Server (Slow Queue Mode)</h1>
+    <p>Data Count: ${globalCache.data.length}</p>
+    <p>Line Stats: ${JSON.stringify(globalCache.debugInfo)}</p>
+  `);
 });
 
 app.get('/api/trains', (req, res) => {
@@ -141,6 +165,7 @@ app.get('/api/debug', (req, res) => {
       message: globalCache.message,
       dataCount: globalCache.data.length,
       lastUpdated: globalCache.lastUpdated,
+      lineStats: globalCache.debugInfo // 讓你在 App 診斷也能看到每條線的狀況
     },
     lastError: globalCache.rawError
   });
