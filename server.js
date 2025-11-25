@@ -10,7 +10,6 @@ const PORT = process.env.PORT || 3000;
 const TDX_CLIENT_ID = process.env.TDX_CLIENT_ID || '';
 const TDX_CLIENT_SECRET = process.env.TDX_CLIENT_SECRET || '';
 
-// --- 記憶體快取 ---
 let globalCache = {
   success: false,
   message: "初始化中...",
@@ -52,7 +51,11 @@ async function getAuthToken() {
   }
 }
 
-// --- 2. 抓取資料 (修正：加上 $top=3000 參數) ---
+// --- 2. 抓取資料 (根據截圖修正) ---
+// 台北捷運所有路線代號 (根據官方文件)
+// BL:板南, R:淡水信義, G:松山新店, O:中和新蘆, BR:文湖, Y:環狀
+const LINES = ['BL', 'R', 'G', 'O', 'BR', 'Y']; 
+
 async function fetchTDXData() {
   if (!authToken) {
     const success = await getAuthToken();
@@ -60,26 +63,43 @@ async function fetchTDXData() {
   }
 
   try {
-    // [關鍵修正] 根據您提供的圖片，我們加上 $top=3000 參數
-    // 這會告訴 TDX 不要分頁，直接給我們最多 3000 筆資料 (足夠涵蓋全線列車)
-    const url = 'https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/LiveBoard/TRTC?%24top=3000&%24format=JSON';
-    
-    const response = await axios.get(url, {
-      headers: { 
-        'Authorization': `Bearer ${authToken}`,
-        'Accept': 'application/json'
+    // 使用 Promise.all 同時抓取所有路線，效率最高
+    // 根據截圖，我們使用 LiveBoard API，並加上 $top 參數來繞過預設的 30 筆限制
+    const requests = LINES.map(lineId => {
+      return axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/LiveBoard/TRTC', {
+        headers: { 
+          'Authorization': `Bearer ${authToken}`,
+          'Accept': 'application/json'
+        },
+        params: {
+          '$filter': `LineNo eq '${lineId}'`, // 篩選路線
+          '$top': 2000, // 根據截圖，必須指定 top 否則只會回傳 30 筆 (設定 2000 絕對夠)
+          '$format': 'JSON'
+        }
+      });
+    });
+
+    const responses = await Promise.all(requests);
+
+    // 合併資料
+    let allData = [];
+    responses.forEach(res => {
+      if (res.data && Array.isArray(res.data)) {
+        allData = allData.concat(res.data);
       }
     });
 
-    const rawData = response.data;
-
-    // --- 資料轉換邏輯 ---
-    const processedData = rawData.map(item => ({
+    // --- 資料轉換 (對應截圖中的 JSON 結構) ---
+    const processedData = allData.map(item => ({
       stationID: item.StationID,
-      // 使用 ?. 運算子，如果沒有中文名就回傳空字串
+      // 根據截圖，StationName 是物件，裡面有 Zh_tw
       stationName: item.StationName?.Zh_tw || item.StationID || '未知站名',
-      destination: item.DestinationName?.Zh_tw || '未知目的地',
+      // 根據截圖，DestinationStationName 也是物件
+      destination: item.DestinationStationName?.Zh_tw || item.DestinationStationID || '未知目的地', // 修正這裡，截圖顯示有 DestinationStationName
+      // 截圖顯示有 EstimateTime (整數，分鐘)
       time: item.EstimateTime || 0, 
+      lineNo: item.LineNo,
+      // 模擬擁擠度 (因為 LiveBoard 沒有這個欄位)
       crowdLevel: 'LOW' 
     }));
 
@@ -89,14 +109,13 @@ async function fetchTDXData() {
     globalCache.message = "資料更新正常";
     globalCache.rawError = null;
     
-    console.log(`🔄 [${new Date().toLocaleTimeString()}] LiveBoard 更新成功: 抓到 ${processedData.length} 筆資料`);
+    console.log(`🔄 [${new Date().toLocaleTimeString()}] 官方文件版更新成功: 抓到 ${processedData.length} 筆資料`);
 
   } catch (error) {
     const status = error.response ? error.response.status : 'Unknown';
     console.error(`❌ 抓取資料失敗 (Status: ${status})`);
     globalCache.rawError = error.response ? error.response.data : error.message;
 
-    // 401 代表 Token 過期，重抓
     if (status === 401) {
       console.log('Token 過期，重試中...');
       authToken = null;
@@ -105,16 +124,16 @@ async function fetchTDXData() {
   }
 }
 
-// --- 3. 設定排程 ---
+// --- 3. 排程 ---
 fetchTDXData();
 setInterval(fetchTDXData, 20000); 
 
 // --- 4. 路由 ---
 app.get('/', (req, res) => {
   res.send(`
-    <h1>TDX Server (LiveBoard)</h1>
+    <h1>TDX Server (Official Docs Fixed)</h1>
     <p>Status: ${globalCache.success ? '🟢 Online' : '🔴 Error'}</p>
-    <p>Data Count: ${globalCache.data.length} (應該要大於 18)</p>
+    <p>Data Count: ${globalCache.data.length}</p>
     <p>Last Update: ${globalCache.lastUpdated?.toLocaleString()}</p>
     <p><a href="/api/debug">Debug Info</a></p>
   `);
