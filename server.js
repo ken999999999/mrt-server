@@ -5,176 +5,192 @@ const app = express();
 
 app.use(cors());
 
-// --- 環境設定 ---
 const PORT = process.env.PORT || 3000;
 const TDX_CLIENT_ID = process.env.TDX_CLIENT_ID || '';
 const TDX_CLIENT_SECRET = process.env.TDX_CLIENT_SECRET || '';
 
-// --- 記憶體快取 ---
 let globalCache = {
   success: false,
-  message: "系統初始化...",
+  message: "系統初始化中...",
   data: [],
   lastUpdated: null,
-  rawError: null,
-  timetableCount: 0, // 時刻表資料量
-  liveBoardCount: 0  // 即時看板資料量
+  liveBoardCount: 0,
+  timetableCount: 0
 };
 
-// 靜態時刻表暫存
-let staticTimetable = [];
+let staticTimetable = []; // 靜態時刻表
+let liveBoardData = [];   // 即時看板
 
-// --- 1. 取得 Token ---
 let authToken = null;
 
+// 1. 取得 Token
 async function getAuthToken() {
   if (!TDX_CLIENT_ID || !TDX_CLIENT_SECRET) {
-    console.error('❌ 請在 Render 設定環境變數');
-    return false;
+      console.error("❌ 請設定 Render 環境變數");
+      return false;
   }
   try {
     const params = new URLSearchParams();
     params.append('grant_type', 'client_credentials');
     params.append('client_id', TDX_CLIENT_ID);
     params.append('client_secret', TDX_CLIENT_SECRET);
-    const response = await axios.post(
-      'https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token',
-      params,
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-    authToken = response.data.access_token;
-    console.log('✅ Token 取得成功');
+    const res = await axios.post('https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token', params);
+    authToken = res.data.access_token;
+    console.log("✅ Token 取得成功");
     return true;
-  } catch (error) {
-    console.error('Token Error:', error.message);
-    return false;
+  } catch (e) { 
+      console.error("❌ Token 失敗:", e.message);
+      return false; 
   }
 }
 
-// --- 2. 下載靜態時刻表 (每日一次) ---
-async function fetchStaticTimetable() {
+// 2. 抓取靜態時刻表 (每小時)
+async function fetchTimetable() {
   if (!authToken) await getAuthToken();
   try {
-    console.log(`📥 [${new Date().toLocaleTimeString()}] 下載靜態時刻表...`);
-    const response = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/StationTimeTable/TRTC', {
-      headers: { 'Authorization': `Bearer ${authToken}`, 'Accept': 'application/json' },
+    console.log("📥 下載靜態時刻表...");
+    const res = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/StationTimeTable/TRTC', {
+      headers: { 'Authorization': `Bearer ${authToken}` },
       params: { '$top': 5000, '$format': 'JSON' }
     });
-    if (response.data && Array.isArray(response.data)) {
-      staticTimetable = response.data;
-      globalCache.timetableCount = staticTimetable.length;
-      console.log(`✅ 時刻表下載完成: ${staticTimetable.length} 站`);
+    if (res.data) {
+        staticTimetable = res.data;
+        globalCache.timetableCount = staticTimetable.length;
+        console.log(`✅ 時刻表下載完成: ${staticTimetable.length} 站`);
     }
-  } catch (error) {
-    console.error('❌ 時刻表下載失敗:', error.message);
+  } catch (e) { console.error('❌ 時刻表下載失敗:', e.message); }
+}
+
+// 3. 抓取即時看板 (每分鐘)
+async function fetchLiveBoard() {
+  if (!authToken) await getAuthToken();
+  try {
+    // console.log("📡 抓取即時看板...");
+    const res = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/LiveBoard/TRTC', {
+      headers: { 'Authorization': `Bearer ${authToken}` },
+      params: { '$top': 3000, '$format': 'JSON' }
+    });
+    if (res.data) {
+        liveBoardData = res.data;
+        globalCache.liveBoardCount = liveBoardData.length;
+    }
+  } catch (e) { 
+      console.error('❌ LiveBoard 失敗:', e.message);
+      if(e.response?.status === 401) { authToken = null; await getAuthToken(); }
   }
 }
 
-// --- 3. 抓取即時看板 & 混合運算 (每分鐘) ---
-async function updateData() {
-  if (!authToken) {
-    const success = await getAuthToken();
-    if (!success) return;
-  }
-
-  let liveData = [];
-  
-  // (A) 抓取 LiveBoard (即時)
-  try {
-    const response = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/LiveBoard/TRTC', {
-      headers: { 'Authorization': `Bearer ${authToken}`, 'Accept': 'application/json' },
-      params: { '$top': 3000, '$format': 'JSON' }
-    });
-    liveData = response.data || [];
-    globalCache.liveBoardCount = liveData.length;
-  } catch (error) {
-    console.error('LiveBoard Error:', error.message);
-    if (error.response?.status === 401) { authToken = null; await getAuthToken(); }
-  }
-
-  // (B) 混合運算邏輯
+// 4. 混合運算 (每 10 秒)
+function calculateData() {
   const now = new Date();
   // 轉台灣時間 (UTC+8)
   const twTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + (3600000 * 8));
-  const currentMinutes = twTime.getHours() * 60 + twTime.getMinutes();
+  const currentMin = twTime.getHours() * 60 + twTime.getMinutes();
 
   let finalData = [];
 
-  // 1. 先處理 LiveBoard (優先級最高)
-  liveData.forEach(item => {
-    const lineNo = item.LineNO || item.LineNo || 'Unknown';
-    
-    // [秒轉分修正]
-    const seconds = Number(item.EstimateTime) || 0;
-    const minutes = Math.floor(seconds / 60);
+  // A. 先放入即時資料 (LiveBoard)
+  liveBoardData.forEach(item => {
+     const sec = Number(item.EstimateTime) || 0;
+     const min = Math.floor(sec / 60);
+     // 嘗試修正路線代號
+     let lineNo = item.LineNO || item.LineNo;
+     if (!lineNo && item.StationID) {
+         lineNo = item.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
+     }
 
-    finalData.push({
-      uniqueId: `LIVE-${item.StationID}-${item.DestinationStationID}`,
-      stationID: item.StationID,
-      stationName: item.StationName?.Zh_tw || item.StationID,
-      destination: item.DestinationStationName?.Zh_tw || '未知',
-      time: minutes, // 已轉為分鐘
-      lineNo: lineNo,
-      type: 'live', 
-      crowdLevel: 'LOW'
-    });
+     finalData.push({
+       stationID: item.StationID,
+       stationName: item.StationName.Zh_tw,
+       destination: item.DestinationStationName.Zh_tw,
+       lineNo: lineNo,
+       time: min,
+       crowdLevel: 'LOW',
+       type: 'live'
+     });
   });
 
-  // 2. 再從時刻表補資料 (如果 LiveBoard 沒給未來的車)
+  // B. 補入時刻表 (未來 60 分鐘)
   if (staticTimetable.length > 0) {
-    staticTimetable.forEach(st => {
-      if (!st.Timetables) return;
-      
-      // 找到未來 60 分鐘內的班次
-      const futureTrains = st.Timetables.filter(t => {
-        const [h, m] = t.ArrivalTime.split(':').map(Number);
-        const trainMin = h * 60 + m;
-        return trainMin > currentMinutes && trainMin <= (currentMinutes + 60);
-      }).slice(0, 2); // 只取最近 2 班
+      staticTimetable.forEach(st => {
+         if (!st.Timetables) return;
+         
+         // 修正路線代號
+         let lineNo = st.LineNO || st.LineNo;
+         if (!lineNo && st.StationID) {
+             lineNo = st.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
+         }
 
-      futureTrains.forEach(t => {
-        const [h, m] = t.ArrivalTime.split(':').map(Number);
-        const diff = (h * 60 + m) - currentMinutes;
-        const lineNo = st.LineNO || st.LineNo || 'Unknown';
-
-        // 去重：如果該站、該方向已經有 < 3 分鐘的即時資料，就不補這班
-        const hasLive = finalData.some(d => 
-          d.stationID === st.StationID && 
-          d.destination === st.DestinationStationName.Zh_tw &&
-          Math.abs(d.time - diff) < 3
-        );
-
-        if (!hasLive) {
-          finalData.push({
-            uniqueId: `SCH-${st.StationID}-${st.DestinationStationID}-${t.ArrivalTime}`,
-            stationID: st.StationID,
-            stationName: st.StationName.Zh_tw,
-            destination: st.DestinationStationName.Zh_tw,
-            time: diff,
-            lineNo: lineNo,
-            type: 'schedule',
-            crowdLevel: 'LOW'
-          });
-        }
+         st.Timetables.forEach(t => {
+            const [h, m] = t.ArrivalTime.split(':').map(Number);
+            const trainMin = h * 60 + m;
+            
+            // 邏輯：比現在晚，且在未來 60 分鐘內
+            if (trainMin > currentMin && trainMin <= currentMin + 60) {
+               // 檢查是否重複 (與即時資料比對)
+               // 如果該站、該方向已經有 < 5 分鐘誤差內的即時資料，就不補這班
+               const diff = trainMin - currentMin;
+               const isDup = finalData.some(d => 
+                 d.stationID === st.StationID && 
+                 d.destination === st.DestinationStationName.Zh_tw &&
+                 Math.abs(d.time - diff) < 5
+               );
+               
+               if (!isDup) {
+                 finalData.push({
+                   stationID: st.StationID,
+                   stationName: st.StationName.Zh_tw,
+                   destination: st.DestinationStationName.Zh_tw,
+                   lineNo: lineNo,
+                   time: diff,
+                   crowdLevel: 'LOW',
+                   type: 'schedule'
+                 });
+               }
+            }
+         });
       });
-    });
   }
 
   globalCache.data = finalData;
   globalCache.lastUpdated = new Date();
   globalCache.success = true;
-  
-  console.log(`✅ 混合更新完成: Total ${finalData.length} 筆 (Live: ${liveData.length})`);
+  globalCache.message = "資料更新正常";
 }
 
-// --- 排程 ---
-fetchStaticTimetable().then(updateData);
-setInterval(updateData, 60000); 
-setInterval(fetchStaticTimetable, 6 * 60 * 60 * 1000); 
+// --- 排程設定 ---
+// 啟動流程：先抓時刻表 -> 再抓即時 -> 計算
+fetchTimetable().then(() => {
+    fetchLiveBoard().then(calculateData);
+});
+
+setInterval(fetchTimetable, 3600000); // 每 1 小時更新時刻表
+setInterval(fetchLiveBoard, 60000);   // 每 1 分鐘更新即時看板
+setInterval(calculateData, 10000);    // 每 10 秒重新計算倒數
 
 // --- API ---
-app.get('/', (req, res) => res.send(`TDX Server Online. Data: ${globalCache.data.length}`));
-app.get('/api/trains', (req, res) => res.json({ success: true, updatedAt: globalCache.lastUpdated, data: globalCache.data }));
-app.get('/api/debug', (req, res) => res.json({ config: { hasClientId: !!TDX_CLIENT_ID }, status: globalCache }));
+app.get('/', (req, res) => res.send(`TDX Hybrid Server Online. Data: ${globalCache.data.length}`));
 
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.get('/api/trains', (req, res) => {
+    res.json({
+        success: globalCache.success,
+        updatedAt: globalCache.lastUpdated,
+        data: globalCache.data
+    });
+});
+
+app.get('/api/debug', (req, res) => {
+    res.json({
+        config: { hasClientId: !!TDX_CLIENT_ID },
+        status: {
+            success: globalCache.success,
+            message: globalCache.message,
+            dataCount: globalCache.data.length,
+            liveCount: globalCache.liveBoardCount,
+            scheduleCount: globalCache.timetableCount,
+            lastUpdated: globalCache.lastUpdated
+        }
+    });
+});
+
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
