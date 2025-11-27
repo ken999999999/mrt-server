@@ -95,7 +95,31 @@ function calculateData() {
        stationID: item.StationID,
        stationName: item.StationName.Zh_tw,
        destinatio
-n: item.DestinationStationName.Zh_tw,
+       _n: item.DestinationStationName.Zh_tw,
+       get n_3() {
+         return this._n;
+       },
+       set n_3(value) {
+         this._n = value;
+       },
+       get n_2() {
+         return this._n;
+       },
+       set n_2(value) {
+         this._n = value;
+       },
+       get n_1() {
+         return this._n;
+       },
+       set n_1(value) {
+         this._n = value;
+       },
+get n() {
+  return this._n;
+},
+set n(value) {
+  this._n = value;
+},
        lineNo: lineNo,
        time: originalSeconds, // 傳回秒數
        crowdLevel: 'LOW',
