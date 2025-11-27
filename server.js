@@ -94,8 +94,7 @@ function calculateData() {
      finalData.push({
        stationID: item.StationID,
        stationName: item.StationName.Zh_tw,
-       destinatio
-       _n: item.DestinationStationName.Zh_tw,
+       destination: item.DestinationStationName.Zh_tw,
        get n_3() {
          return this._n;
        },
