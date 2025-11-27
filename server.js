@@ -76,17 +76,18 @@ async function fetchLiveBoard() {
 function calculateData() {
   const now = new Date();
   const twTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + (3600000 * 8));
-  const currentMin = twTime.getHours() * 60 + twTime.getMinutes();
+  const currentSeconds = twTime.getHours() * 3600 + twTime.getMinutes() * 60 + twTime.getSeconds();
 
   let finalData = [];
 
-  // A. LiveBoard 處理
+  // A. LiveBoard 處理 (改為回傳秒數)
   liveBoardData.forEach(item => {
-     const sec = Number(item.EstimateTime) || 0;
-     const min = Math.floor(sec / 60);
-     
-     // [關鍵修正] 同時抓取 LineNO (大寫) 和 LineNo (小寫)
-     // 如果都沒有，才嘗試從 StationID 逆推
+     // 這裡不再除以 60，直接保留秒數
+     // 為了實現「提早 30 秒」，我們把這裡的時間「減去 30 秒」
+     // 這樣前端顯示 0 秒時，實際上車子還有 30 秒才到
+     const originalSeconds = Number(item.EstimateTime) || 0;
+     const adjustedSeconds = Math.max(0, originalSeconds - 30);
+
      let lineNo = item.LineNO || item.LineNo;
      if (!lineNo && item.StationID) {
          lineNo = item.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
@@ -96,19 +97,18 @@ function calculateData() {
        stationID: item.StationID,
        stationName: item.StationName.Zh_tw,
        destination: item.DestinationStationName.Zh_tw,
-       lineNo: lineNo, // 確保這裡一定有值
-       time: min,
+       lineNo: lineNo,
+       time: adjustedSeconds, // 這是秒數！
        crowdLevel: 'LOW',
        type: 'live'
      });
   });
 
-  // B. 時刻表補位
+  // B. 時刻表補位 (同樣改為秒數計算)
   if (staticTimetable.length > 0) {
       staticTimetable.forEach(st => {
          if (!st.Timetables) return;
          
-         // 時刻表的欄位也可能不一樣，一樣做雙重檢查
          let lineNo = st.LineNO || st.LineNo;
          if (!lineNo && st.StationID) {
              lineNo = st.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
@@ -116,14 +116,17 @@ function calculateData() {
 
          st.Timetables.forEach(t => {
             const [h, m] = t.ArrivalTime.split(':').map(Number);
-            const trainMin = h * 60 + m;
+            const trainSeconds = h * 3600 + m * 60; // 轉成當天總秒數
             
-            if (trainMin > currentMin && trainMin <= currentMin + 60) {
-               const diff = trainMin - currentMin;
+            // 邏輯：比現在晚，且在未來 3600 秒 (1小時) 內
+            if (trainSeconds > currentSeconds && trainSeconds <= currentSeconds + 3600) {
+               const diffSeconds = Math.max(0, (trainSeconds - currentSeconds) - 30); // 同樣減去 30 秒
+
+               // 去重：誤差範圍放寬到 240 秒 (4分鐘)
                const isDup = finalData.some(d => 
                  d.stationID === st.StationID && 
                  d.destination === st.DestinationStationName.Zh_tw &&
-                 Math.abs(d.time - diff) < 4 
+                 Math.abs(d.time - diffSeconds) < 240 
                );
                
                if (!isDup) {
@@ -131,8 +134,8 @@ function calculateData() {
                    stationID: st.StationID,
                    stationName: st.StationName.Zh_tw,
                    destination: st.DestinationStationName.Zh_tw,
-                   lineNo: lineNo, // 確保有值
-                   time: diff,
+                   lineNo: lineNo,
+                   time: diffSeconds, // 這是秒數！
                    crowdLevel: 'LOW',
                    type: 'schedule'
                  });
@@ -156,7 +159,7 @@ setInterval(fetchTimetable, 3600000);
 setInterval(fetchLiveBoard, 60000);   
 setInterval(calculateData, 10000);    
 
-app.get('/', (req, res) => res.send(`TDX Hybrid Server (Line Fixed). Data: ${globalCache.data.length}`));
+app.get('/', (req, res) => res.send(`TDX Hybrid Server (Seconds Mode). Data: ${globalCache.data.length}`));
 app.get('/api/trains', (req, res) => res.json({ success: true, updatedAt: globalCache.lastUpdated, data: globalCache.data }));
 
 app.listen(PORT, () => console.log(`Server running on ${PORT}`));
