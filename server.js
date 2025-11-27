@@ -13,6 +13,7 @@ let globalCache = {
   success: false,
   message: "系統初始化中...",
   data: [],
+  serverTime: null, // [新增] 伺服器當下時間
   lastUpdated: null,
   liveBoardCount: 0,
   timetableCount: 0
@@ -20,7 +21,6 @@ let globalCache = {
 
 let staticTimetable = [];
 let liveBoardData = [];
-
 let authToken = null;
 
 async function getAuthToken() {
@@ -32,10 +32,9 @@ async function getAuthToken() {
     params.append('client_secret', TDX_CLIENT_SECRET);
     const res = await axios.post('https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token', params);
     authToken = res.data.access_token;
-    console.log("✅ Token 取得成功");
     return true;
   } catch (e) { 
-      console.error("❌ Token 失敗:", e.message);
+      console.error("Token Error", e.message);
       return false; 
   }
 }
@@ -43,7 +42,6 @@ async function getAuthToken() {
 async function fetchTimetable() {
   if (!authToken) await getAuthToken();
   try {
-    console.log("📥 下載靜態時刻表...");
     const res = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/StationTimeTable/TRTC', {
       headers: { 'Authorization': `Bearer ${authToken}` },
       params: { '$top': 5000, '$format': 'JSON' }
@@ -51,9 +49,9 @@ async function fetchTimetable() {
     if (res.data) {
         staticTimetable = res.data;
         globalCache.timetableCount = staticTimetable.length;
-        console.log(`✅ 時刻表下載完成: ${staticTimetable.length} 站`);
+        console.log(`✅ 時刻表更新: ${staticTimetable.length} 筆`);
     }
-  } catch (e) { console.error('❌ 時刻表下載失敗:', e.message); }
+  } catch (e) { console.error('Timetable Error', e.message); }
 }
 
 async function fetchLiveBoard() {
@@ -68,65 +66,52 @@ async function fetchLiveBoard() {
         globalCache.liveBoardCount = liveBoardData.length;
     }
   } catch (e) { 
-      console.error('❌ LiveBoard 失敗:', e.message);
       if(e.response?.status === 401) { authToken = null; await getAuthToken(); }
   }
 }
 
 function calculateData() {
   const now = new Date();
+  // 轉台灣時間 (UTC+8)
   const twTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + (3600000 * 8));
-  const currentSeconds = twTime.getHours() * 3600 + twTime.getMinutes() * 60 + twTime.getSeconds();
+  const currentMin = twTime.getHours() * 60 + twTime.getMinutes();
 
   let finalData = [];
 
-  // A. LiveBoard 處理 (改為回傳秒數)
+  // A. LiveBoard
   liveBoardData.forEach(item => {
-     // 這裡不再除以 60，直接保留秒數
-     // 為了實現「提早 30 秒」，我們把這裡的時間「減去 30 秒」
-     // 這樣前端顯示 0 秒時，實際上車子還有 30 秒才到
-     const originalSeconds = Number(item.EstimateTime) || 0;
-     const adjustedSeconds = Math.max(0, originalSeconds - 30);
-
+     const sec = Number(item.EstimateTime) || 0;
+     const min = Math.floor(sec / 60);
      let lineNo = item.LineNO || item.LineNo;
-     if (!lineNo && item.StationID) {
-         lineNo = item.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
-     }
+     if (!lineNo && item.StationID) lineNo = item.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
 
      finalData.push({
        stationID: item.StationID,
        stationName: item.StationName.Zh_tw,
        destination: item.DestinationStationName.Zh_tw,
        lineNo: lineNo,
-       time: adjustedSeconds, // 這是秒數！
-       crowdLevel: 'LOW',
+       time: min,
        type: 'live'
      });
   });
 
-  // B. 時刻表補位 (同樣改為秒數計算)
+  // B. TimeTable 補位
   if (staticTimetable.length > 0) {
       staticTimetable.forEach(st => {
          if (!st.Timetables) return;
-         
          let lineNo = st.LineNO || st.LineNo;
-         if (!lineNo && st.StationID) {
-             lineNo = st.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
-         }
+         if (!lineNo && st.StationID) lineNo = st.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
 
          st.Timetables.forEach(t => {
             const [h, m] = t.ArrivalTime.split(':').map(Number);
-            const trainSeconds = h * 3600 + m * 60; // 轉成當天總秒數
+            const trainMin = h * 60 + m;
             
-            // 邏輯：比現在晚，且在未來 3600 秒 (1小時) 內
-            if (trainSeconds > currentSeconds && trainSeconds <= currentSeconds + 3600) {
-               const diffSeconds = Math.max(0, (trainSeconds - currentSeconds) - 30); // 同樣減去 30 秒
-
-               // 去重：誤差範圍放寬到 240 秒 (4分鐘)
+            if (trainMin > currentMin && trainMin <= currentMin + 60) {
+               const diff = trainMin - currentMin;
                const isDup = finalData.some(d => 
                  d.stationID === st.StationID && 
                  d.destination === st.DestinationStationName.Zh_tw &&
-                 Math.abs(d.time - diffSeconds) < 240 
+                 Math.abs(d.time - diff) < 5
                );
                
                if (!isDup) {
@@ -135,8 +120,7 @@ function calculateData() {
                    stationName: st.StationName.Zh_tw,
                    destination: st.DestinationStationName.Zh_tw,
                    lineNo: lineNo,
-                   time: diffSeconds, // 這是秒數！
-                   crowdLevel: 'LOW',
+                   time: diff,
                    type: 'schedule'
                  });
                }
@@ -146,9 +130,9 @@ function calculateData() {
   }
 
   globalCache.data = finalData;
+  globalCache.serverTime = new Date().toISOString(); // [新增] 回傳 ISO 格式時間
   globalCache.lastUpdated = new Date();
   globalCache.success = true;
-  globalCache.message = "資料更新正常";
 }
 
 fetchTimetable().then(() => {
@@ -159,7 +143,11 @@ setInterval(fetchTimetable, 3600000);
 setInterval(fetchLiveBoard, 60000);   
 setInterval(calculateData, 10000);    
 
-app.get('/', (req, res) => res.send(`TDX Hybrid Server (Seconds Mode). Data: ${globalCache.data.length}`));
-app.get('/api/trains', (req, res) => res.json({ success: true, updatedAt: globalCache.lastUpdated, data: globalCache.data }));
+app.get('/', (req, res) => res.send(`Server OK. Data: ${globalCache.data.length}`));
+app.get('/api/trains', (req, res) => res.json({ 
+    success: globalCache.success, 
+    serverTime: globalCache.serverTime, // 傳給前端校準
+    data: globalCache.data 
+}));
 
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => console.log(`Server on ${PORT}`));
