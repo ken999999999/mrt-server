@@ -1,189 +1,226 @@
+/* mrt-server/server.js */
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const xml2js = require('xml2js');
 const app = express();
 
 app.use(cors());
 
 const PORT = process.env.PORT || 3000;
+
+// 請設定你的官方 API 帳號密碼 (環境變數或直接填入)
+const MRT_USER = process.env.MRT_USER || '你的帳號';
+const MRT_PASS = process.env.MRT_PASS || '你的密碼';
+
+// TDX 僅用於取得 "站名 <-> ID" 對照表，若無 TDX 也可運作 (會少 ID)
 const TDX_CLIENT_ID = process.env.TDX_CLIENT_ID || '';
 const TDX_CLIENT_SECRET = process.env.TDX_CLIENT_SECRET || '';
 
+// 暫存資料
 let globalCache = {
   success: false,
   message: "系統初始化中...",
+  serverTime: null,
   data: [],
-  serverTime: null, // [新增] 伺服器當下時間
-  lastUpdated: null,
-  liveBoardCount: 0,
-  timetableCount: 0
+  nameToIdMap: {} // 站名轉 ID 對照表 (e.g. "台北車站" -> "BL12")
 };
 
-let staticTimetable = [];
-let liveBoardData = [];
-let authToken = null;
-
-async function getAuthToken() {
-  if (!TDX_CLIENT_ID || !TDX_CLIENT_SECRET) return false;
-  try {
-    const params = new URLSearchParams();
-    params.append('grant_type', 'client_credentials');
-    params.append('client_id', TDX_CLIENT_ID);
-    params.append('client_secret', TDX_CLIENT_SECRET);
-    const res = await axios.post('https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token', params);
-    authToken = res.data.access_token;
-    return true;
-  } catch (e) { 
-      console.error("Token Error", e.message);
-      return false; 
-  }
-}
-
-async function fetchTimetable() {
-  if (!authToken) await getAuthToken();
-  try {
-    const res = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/StationTimeTable/TRTC', {
-      headers: { 'Authorization': `Bearer ${authToken}` },
-      params: { '$top': 5000, '$format': 'JSON' }
-    });
-    if (res.data) {
-        staticTimetable = res.data;
-        globalCache.timetableCount = staticTimetable.length;
-        console.log(`✅ 時刻表更新: ${staticTimetable.length} 筆`);
+// 輔助：解析 XML
+const parseXML = async (xml) => {
+    const parser = new xml2js.Parser({ explicitArray: false, ignoreAttrs: true });
+    try {
+        return await parser.parseStringPromise(xml);
+    } catch (e) {
+        return null;
     }
-  } catch (e) { console.error('Timetable Error', e.message); }
+};
+
+// 1. 取得 TDX 站名對照表 (為了把官方中文站名轉成 ID)
+async function fetchStationMapping() {
+    if (!TDX_CLIENT_ID || !TDX_CLIENT_SECRET) return;
+    try {
+        // 取得 Token
+        const params = new URLSearchParams();
+        params.append('grant_type', 'client_credentials');
+        params.append('client_id', TDX_CLIENT_ID);
+        params.append('client_secret', TDX_CLIENT_SECRET);
+        const tokenRes = await axios.post('https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token', params);
+        const token = tokenRes.data.access_token;
+
+        // 取得車站資料
+        const res = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/Station/TRTC', {
+            headers: { 'Authorization': `Bearer ${token}` },
+            params: { '$format': 'JSON' }
+        });
+        
+        if (res.data) {
+            res.data.forEach(st => {
+                // 建立對照: "忠孝復興" -> "BL15" (若有轉乘，可能會被覆蓋，以後蓋前為主或保留多個)
+                // 這裡簡單處理，Mapping 中文名到 StationID
+                globalCache.nameToIdMap[st.StationName.Zh_tw] = st.StationID;
+            });
+            console.log(`✅ 車站對照表更新: ${Object.keys(globalCache.nameToIdMap).length} 筆`);
+        }
+    } catch (e) { console.error("TDX Mapping Error:", e.message); }
 }
 
-async function fetchLiveBoard() {
-  if (!authToken) await getAuthToken();
-  try {
-    const res = await axios.get('https://tdx.transportdata.tw/api/basic/v2/Rail/Metro/LiveBoard/TRTC', {
-      headers: { 'Authorization': `Bearer ${authToken}` },
-      params: { '$top': 3000, '$format': 'JSON' }
-    });
-    if (res.data) {
-        liveBoardData = res.data;
-        globalCache.liveBoardCount = liveBoardData.length;
+// 2. 官方 API: 列車到站資訊 (TrackInfo)
+async function fetchTrackInfo() {
+    const xmlBody = `<?xml version="1.0" encoding="utf-8"?>
+    <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+      <soap:Body>
+        <getTrackInfo xmlns="http://tempuri.org/">
+          <userName>${MRT_USER}</userName>
+          <password>${MRT_PASS}</password>
+        </getTrackInfo>
+      </soap:Body>
+    </soap:Envelope>`;
+
+    try {
+        const res = await axios.post('https://api.metro.taipei/metroapi/TrackInfo.asmx', xmlBody, {
+            headers: { 'Content-Type': 'text/xml; charset=utf-8' }
+        });
+        const parsed = await parseXML(res.data);
+        // 解析 JSON 字串 (官方 API 回傳的 XML 裡面包了一層 JSON 字串)
+        // 結構: Envelope.Body.getTrackInfoResponse.getTrackInfoResult (string)
+        const rawJson = parsed['soap:Envelope']['soap:Body']['getTrackInfoResponse']['getTrackInfoResult'];
+        return JSON.parse(rawJson);
+    } catch (e) {
+        console.error("TrackInfo Error:", e.message);
+        return [];
     }
-  } catch (e) { 
-      if(e.response?.status === 401) { authToken = null; await getAuthToken(); }
-  }
 }
 
-function calculateData() {
-  const now = new Date();
-  const twTime = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + (3600000 * 8));
-  const currentSeconds = twTime.getHours() * 3600 + twTime.getMinutes() * 60 + twTime.getSeconds();
+// 3. 官方 API: 擁擠度 (高運量 + 文湖線)
+async function fetchCrowdedness() {
+    let crowdednessMap = {}; // Key: StationID or Name, Value: Level
 
-  let finalData = [];
+    const fetchAPI = async (url, method) => {
+        const xmlBody = `<?xml version="1.0" encoding="utf-8"?>
+        <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+          <soap:Body>
+            <${method} xmlns="http://tempuri.org/">
+              <userName>${MRT_USER}</userName>
+              <password>${MRT_PASS}</password>
+            </${method}>
+          </soap:Body>
+        </soap:Envelope>`;
+        try {
+            const res = await axios.post(url, xmlBody, { headers: { 'Content-Type': 'text/xml; charset=utf-8' } });
+            const parsed = await parseXML(res.data);
+            const rawJson = parsed['soap:Envelope']['soap:Body'][`${method}Response`][`${method}Result`];
+            return JSON.parse(rawJson);
+        } catch (e) { return []; }
+    };
 
-  // A. LiveBoard (保留原始秒數，不再除以 60)
-  liveBoardData.forEach(item => {
-     const originalSeconds = Number(item.EstimateTime) || 0;
-     
-     // [關鍵] 這裡不除以 60，直接回傳秒數
-     // 為了讓使用者有緩衝，我們在後端這裡 "扣掉" 0 秒 (原汁原味)，前端再去判斷
-     // 如果想要「提早 30 秒」的效果，可以在這裡寫 Math.max(0, originalSeconds - 30)
-     // 但建議傳回真實秒數，讓前端 UI 去決定何時顯示 "進站中"
-     
-     let lineNo = item.LineNO || item.LineNo;
-     if (!lineNo && item.StationID) {
-         lineNo = item.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
-     }
+    // 並行取得
+    const [highCap, wenhu] = await Promise.all([
+        fetchAPI('https://api.metro.taipei/metroapi/CarWeight.asmx', 'getCarWeightByInfoEx'),
+        fetchAPI('https://api.metro.taipei/metroapi/CarWeightBR.asmx', 'getCarWeightBRInfo')
+    ]);
 
-     finalData.push({
-       stationID: item.StationID,
-       stationName: item.StationName.Zh_tw,
-       destination: item.DestinationStationName.Zh_tw,
-       get n_3() {
-         return this._n;
-       },
-       set n_3(value) {
-         this._n = value;
-       },
-       get n_2() {
-         return this._n;
-       },
-       set n_2(value) {
-         this._n = value;
-       },
-       get n_1() {
-         return this._n;
-       },
-       set n_1(value) {
-         this._n = value;
-       },
-get n() {
-  return this._n;
-},
-set n(value) {
-  this._n = value;
-},
-       lineNo: lineNo,
-       time: originalSeconds, // 傳回秒數
-       crowdLevel: 'LOW',
-       type: 'live'
-     });
-  });
-
-  // B. 時刻表補位 (轉成秒數)
-  if (staticTimetable.length > 0) {
-      staticTimetable.forEach(st => {
-         if (!st.Timetables) return;
-         
-         let lineNo = st.LineNO || st.LineNo;
-         if (!lineNo && st.StationID) lineNo = st.StationID.match(/^([A-Z]+)/)?.[1] || 'Unknown';
-
-         st.Timetables.forEach(t => {
-            const [h, m] = t.ArrivalTime.split(':').map(Number);
-            const trainSeconds = h * 3600 + m * 60;
-            
-            // 未來 1 小時內的車
-            if (trainSeconds > currentSeconds && trainSeconds <= currentSeconds + 3600) {
-               const diff = trainSeconds - currentSeconds;
-               
-               // 去重：誤差 < 180秒 視為同一班
-               const isDup = finalData.some(d => 
-                 d.stationID === st.StationID && 
-                 d.destination === st.DestinationStationName.Zh_tw &&
-                 Math.abs(d.time - diff) < 180 
-               );
-               
-               if (!isDup) {
-                 finalData.push({
-                   stationID: st.StationID,
-                   stationName: st.StationName.Zh_tw,
-                   destination: st.DestinationStationName.Zh_tw,
-                   lineNo: lineNo,
-                   time: diff, // 傳回秒數
-                   crowdLevel: 'LOW',
-                   type: 'schedule'
-                 });
-               }
+    // 處理擁擠度資料
+    // HighCap 格式: [{"TrainNumber":"132", "StationID":"BL11", "Car1":"1", ...}] (1=舒適, 2=普通, 3=略擠, 4=擁擠)
+    // 我們將擁擠度平均或取最大值，綁定到車站ID，表示「該車站目前有這班車的擁擠度」
+    const process = (list) => {
+        if (!list) return;
+        list.forEach(train => {
+            if (train.StationID) {
+                // 簡單計算：取最大擁擠度
+                let maxLevel = 1;
+                for (let i = 1; i <= 6; i++) {
+                    if (train[`Car${i}`]) maxLevel = Math.max(maxLevel, parseInt(train[`Car${i}`]) || 1);
+                }
+                // 轉換為 App 顯示字串
+                let levelStr = 'LOW'; // 綠
+                if (maxLevel === 2) levelStr = 'MEDIUM'; // 黃
+                if (maxLevel === 3) levelStr = 'HIGH'; // 橘
+                if (maxLevel >= 4) levelStr = 'FULL'; // 紅
+                
+                // 存入 Map，Key 為 StationID (e.g., "BL11")
+                crowdednessMap[train.StationID] = levelStr;
             }
-         });
-      });
-  }
+        });
+    };
 
-  globalCache.data = finalData;
-  globalCache.lastUpdated = new Date();
-  globalCache.success = true;
-  globalCache.message = "資料更新正常(秒數版)";
+    process(highCap);
+    process(wenhu);
+    return crowdednessMap;
 }
 
-fetchTimetable().then(() => {
-    fetchLiveBoard().then(calculateData);
+// 整合資料並更新 Cache
+async function updateData() {
+    console.log("🔄 開始更新資料...");
+    const [trackInfo, crowdMap] = await Promise.all([fetchTrackInfo(), fetchCrowdedness()]);
+    
+    // 處理 TrackInfo
+    // 格式: [{"StationName":"台北車站", "DestinationName":"南港展覽館", "CountDown":"01:28", ...}]
+    
+    let finalData = [];
+    trackInfo.forEach(item => {
+        const stationName = item.StationName.replace('站', ''); // 去掉"站"字以匹配
+        const stationID = globalCache.nameToIdMap[stationName] || item.StationName;
+        
+        let seconds = 0;
+        if (item.CountDown === '列車進站') {
+            seconds = 0;
+        } else if (item.CountDown.includes(':')) {
+            const parts = item.CountDown.split(':');
+            seconds = parseInt(parts[0]) * 60 + parseInt(parts[1]);
+        } else {
+            seconds = 9999; // 未知
+        }
+
+        // 判斷路線代號 (從 StationID 猜測)
+        let lineNo = 'Unknown';
+        if (stationID.match(/^[A-Z]+/)) {
+            lineNo = stationID.match(/^[A-Z]+/)[0];
+        }
+
+        // 嘗試匹配擁擠度
+        // 邏輯：如果列車「即將進站」(seconds < 30)，且該車站ID在 crowdMap 中有資料，就使用該資料
+        // 注意：官方 API 擁擠度是「列車所在地」，到站資訊是「預估時間」。
+        // 當列車進站時 (seconds=0)，兩者應該重合。
+        let crowdLevel = 'LOW'; // 預設
+        if (seconds < 40 && crowdMap[stationID]) {
+            crowdLevel = crowdMap[stationID];
+        }
+
+        finalData.push({
+            stationID: stationID,
+            stationName: stationName,
+            destination: item.DestinationName.replace('站', ''),
+            lineNo: lineNo,
+            time: seconds,
+            crowdLevel: crowdLevel, // 加入擁擠度
+            type: 'live'
+        });
+    });
+
+    globalCache.data = finalData;
+    globalCache.serverTime = new Date().toISOString(); // 回傳 ISO 時間
+    globalCache.success = true;
+    globalCache.message = "資料更新完成";
+    console.log(`✅ 更新完成: ${finalData.length} 筆列車資料`);
+}
+
+// 啟動流程
+fetchStationMapping().then(() => {
+    updateData();
+    // 設定 30 秒更新一次 (符合你的需求)
+    setInterval(updateData, 30000);
 });
 
-setInterval(fetchTimetable, 3600000); 
-setInterval(fetchLiveBoard, 60000);   
-setInterval(calculateData, 10000);    
+// API路由
+app.get('/', (req, res) => res.send(`Server Running. Data Count: ${globalCache.data.length}`));
+app.get('/api/trains', (req, res) => {
+    // 這裡我們回傳 serverTime 讓前端做校正
+    res.json({
+        success: globalCache.success,
+        serverTime: new Date().toISOString(), // 請求當下的精確時間
+        data: globalCache.data
+    });
+});
 
-app.get('/', (req, res) => res.send(`Server OK. Data: ${globalCache.data.length}`));
-app.get('/api/trains', (req, res) => res.json({ 
-    success: globalCache.success, 
-    serverTime: globalCache.serverTime, // 傳給前端校準
-    data: globalCache.data 
-}));
-
-app.listen(PORT, () => console.log(`Server on ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
