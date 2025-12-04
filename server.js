@@ -10,8 +10,8 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 // ⚠️⚠️⚠️ 請務必確認這裡填入的是正確的官方 API 帳號與密碼
-const MRT_USER = process.env.MRT_USER || '你的帳號';
-const MRT_PASS = process.env.MRT_PASS || '你的密碼';
+const MRT_USER = process.env.MRT_USER || '';
+const MRT_PASS = process.env.MRT_PASS || '';
 
 // TDX 設定 (選填)
 const TDX_CLIENT_ID = process.env.TDX_CLIENT_ID || '';
