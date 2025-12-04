@@ -1,4 +1,5 @@
 /* mrt-server/server.js */
+require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -9,9 +10,29 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 
-// ⚠️⚠️⚠️ 請務必確認這裡填入的是正確的官方 API 帳號與密碼
-const MRT_USER = process.env.MRT_USER || '';
-const MRT_PASS = process.env.MRT_PASS || '';
+// 讀取環境變數
+const MRT_USER = process.env.MRT_USER;
+const MRT_PASS = process.env.MRT_PASS;
+
+// --- 🔍 除錯區域：檢查 Render 到底讀到了什麼 ---
+console.log("========================================");
+if (!MRT_USER) {
+    console.error("❌ 嚴重錯誤：Render 環境變數中找不到 MRT_USER！");
+} else {
+    console.log(`✅ MRT_USER 讀取成功: 長度 ${MRT_USER.length} 字元`);
+    console.log(`   前兩碼: ${MRT_USER.substring(0, 2)}***`); // 核對一下前兩碼對不對
+}
+
+if (!MRT_PASS) {
+    console.error("❌ 嚴重錯誤：Render 環境變數中找不到 MRT_PASS！");
+} else {
+    console.log(`✅ MRT_PASS 讀取成功: 長度 ${MRT_PASS.length} 字元`);
+    // 不要印出密碼，但確認長度是否符合預期
+}
+console.log("========================================");
+// ----------------------------------------------
+
+// ... (後面的程式碼保持不變)
 
 // TDX 設定 (選填)
 const TDX_CLIENT_ID = process.env.TDX_CLIENT_ID || '';
