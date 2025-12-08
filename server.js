@@ -1,4 +1,4 @@
-// server.js - Taipei Metro TrackInfo + CarWeight backend (simplified JSON extractor)
+// server.js - Taipei Metro TrackInfo + CarWeight backend (TrackInfo + CarWeightEx + CarWeightBR)
 
 require('dotenv').config();
 const express = require('express');
@@ -20,18 +20,19 @@ if (!MRT_USER || !MRT_PASS) {
 
 // TRTC endpoints
 const TRACK_INFO_URL = 'https://api.metro.taipei/metroapi/TrackInfo.asmx';
-const CAR_WEIGHT_URL = 'https://api.metro.taipei/metroapi/CarWeight.asmx';
+const CAR_WEIGHT_EX_URL = 'https://api.metro.taipei/metroapi/CarWeight.asmx';     // getCarWeightByInfoEx（全部高運量線，不含文湖）
+const CAR_WEIGHT_BR_URL = 'https://api.metro.taipei/metroapi/CarWeightBR.asmx';   // getCarWeightBRInfo（文湖線）
 
 // 簡單的全域快取
 const cache = {
   lastUpdate: null,
   trackInfo: [],
-  carWeight: [],
+  carWeight: [],  // Ex + BR 合併後的全部擁擠度
   merged: [],
   ok: false,
 };
 
-// ====== SOAP body（就是你 Postman 成功的那兩段） ======
+// ====== SOAP body（依照你 Postman 成功的格式） ======
 function buildTrackInfoSoap() {
   return `<?xml version="1.0" encoding="utf-8"?>
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
@@ -44,14 +45,28 @@ function buildTrackInfoSoap() {
 </soap12:Envelope>`;
 }
 
-function buildCarWeightSoap() {
+// 高運量（板南、淡水信義、中和新蘆、松山新店…）擁擠度
+function buildCarWeightExSoap() {
   return `<?xml version="1.0" encoding="utf-8"?>
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
   <soap12:Body>
-    <getCarWeightByInfo xmlns="http://tempuri.org/">
+    <getCarWeightByInfoEx xmlns="http://tempuri.org/">
       <userName>${MRT_USER}</userName>
       <passWord>${MRT_PASS}</passWord>
-    </getCarWeightByInfo>
+    </getCarWeightByInfoEx>
+  </soap12:Body>
+</soap12:Envelope>`;
+}
+
+// 文湖線擁擠度
+function buildCarWeightBRSoap() {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
+  <soap12:Body>
+    <getCarWeightBRInfo xmlns="http://tempuri.org/">
+      <userName>${MRT_USER}</userName>
+      <passWord>${MRT_PASS}</passWord>
+    </getCarWeightBRInfo>
   </soap12:Body>
 </soap12:Envelope>`;
 }
@@ -62,7 +77,7 @@ function extractJsonArrayFromSoap(raw, tagName) {
     raw = String(raw);
   }
 
-  // 先粗略檢查有沒有錯誤頁
+  // 粗略檢查有沒有錯誤頁
   if (raw.includes('<title>請洽系統管理員') || raw.includes('<html')) {
     console.error(`❌ ${tagName} 收到 HTML 錯誤頁，無法解析 JSON。`);
     return [];
@@ -96,7 +111,7 @@ function extractJsonArrayFromSoap(raw, tagName) {
     const parsed = JSON.parse(jsonSlice);
     return normalizeParsed(parsed);
   } catch (e1) {
-    // 第二輪：把 \" 還原成 " 再試一次（CarWeight 會是這種格式）
+    // 第二輪：把 \" 還原成 " 再試一次（某些 API 會是這種格式）
     try {
       const unescaped = jsonSlice
         .replace(/\\"/g, '"')   // 把 \" 變回 "
@@ -110,7 +125,7 @@ function extractJsonArrayFromSoap(raw, tagName) {
   }
 }
 
-// ====== 呼叫 TRTC 兩支 API ======
+// ====== 呼叫 TRTC 3 支 API ======
 async function fetchTrackInfo() {
   const soapBody = buildTrackInfoSoap();
   const res = await axios.post(TRACK_INFO_URL, soapBody, {
@@ -120,16 +135,38 @@ async function fetchTrackInfo() {
   return extractJsonArrayFromSoap(res.data, 'TrackInfo');
 }
 
-async function fetchCarWeight() {
-  const soapBody = buildCarWeightSoap();
-  const res = await axios.post(CAR_WEIGHT_URL, soapBody, {
+async function fetchCarWeightEx() {
+  const soapBody = buildCarWeightExSoap();
+  const res = await axios.post(CAR_WEIGHT_EX_URL, soapBody, {
     headers: { 'Content-Type': 'text/xml; charset=utf-8' },
     timeout: 10000,
   });
-  return extractJsonArrayFromSoap(res.data, 'CarWeight');
+  return extractJsonArrayFromSoap(res.data, 'CarWeightEx');
 }
 
-// 將兩邊資料合併（用 TrainNumber 當 key）
+async function fetchCarWeightBR() {
+  const soapBody = buildCarWeightBRSoap();
+  const res = await axios.post(CAR_WEIGHT_BR_URL, soapBody, {
+    headers: { 'Content-Type': 'text/xml; charset=utf-8' },
+    timeout: 10000,
+  });
+  return extractJsonArrayFromSoap(res.data, 'CarWeightBR');
+}
+
+async function fetchCarWeightAll() {
+  const [exList, brList] = await Promise.all([
+    fetchCarWeightEx(),
+    fetchCarWeightBR(),
+  ]);
+
+  // 給每筆加上 lineType 方便除錯 / 未來 UI 用
+  exList.forEach(row => { row.lineType = 'HighCapacity'; }); // 高運量線（板南、淡水信義、松山新店、中和新蘆…）
+  brList.forEach(row => { row.lineType = 'Wenhu'; });        // 文湖線 BR
+
+  return [...exList, ...brList];
+}
+
+// 將 TrackInfo + CarWeight 合併（用 TrainNumber 當 key）
 function mergeTrackAndWeight(trackList, weightList) {
   const weightByTrain = new Map();
   (weightList || []).forEach(row => {
@@ -153,7 +190,7 @@ function mergeTrackAndWeight(trackList, weightList) {
   });
 }
 
-// 站碼對中文站名（先幫你放一個忠孝新生）
+// 站碼對中文站名（先幫你放一個忠孝新生，之後可以自己擴充）
 const stationIdToName = {
   BL12: '忠孝新生站',
 };
@@ -198,20 +235,21 @@ async function updateAll() {
   }
 
   try {
-    console.log('⏳ 正在更新 TrackInfo / CarWeight …');
-    const [trackList, weightList] = await Promise.all([
+    console.log('⏳ 正在更新 TrackInfo / CarWeightEx / CarWeightBR …');
+
+    const [trackList, weightAll] = await Promise.all([
       fetchTrackInfo(),
-      fetchCarWeight(),
+      fetchCarWeightAll(),
     ]);
 
     cache.lastUpdate = new Date().toISOString();
     cache.trackInfo = trackList;
-    cache.carWeight = weightList;
-    cache.merged = mergeTrackAndWeight(trackList, weightList);
+    cache.carWeight = weightAll;
+    cache.merged = mergeTrackAndWeight(trackList, weightAll);
     cache.ok = true;
 
     console.log(
-      `✅ 更新完成：TrackInfo=${trackList.length} 筆, CarWeight=${weightList.length} 筆, merged=${cache.merged.length} 筆`
+      `✅ 更新完成：TrackInfo=${trackList.length} 筆, CarWeightAll=${weightAll.length} 筆, merged=${cache.merged.length} 筆`
     );
   } catch (e) {
     console.error('❌ 更新資料失敗:', e.message);
@@ -247,7 +285,7 @@ app.get('/api/raw/track-info', (req, res) => {
   });
 });
 
-// 原始擁擠度資料
+// 原始擁擠度資料（高運量 + 文湖線）
 app.get('/api/raw/car-weight', (req, res) => {
   res.json({
     success: cache.ok,
