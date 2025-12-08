@@ -110,7 +110,7 @@ async function fetchTrackInfo() {
 async function fetchCarWeight() {
   const soapBody = buildCarWeightSoap();
   const res = await axios.post(CAR_WEIGHT_URL, soapBody, {
-    headers: { 'Content-Type: text/xml; charset=utf-8' },
+    headers: { 'Content-Type': 'text/xml; charset=utf-8' },
     timeout: 10000,
   });
   return extractJsonArrayFromSoap(res.data, 'CarWeight');
