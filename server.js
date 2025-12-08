@@ -1,3 +1,5 @@
+// server.js － TRTC API Proxy（不需要 CAR_ID_LIST 版）
+
 require('dotenv').config();
 
 const express = require('express');
@@ -10,35 +12,29 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 
-// 捷運 API 帳密
+// 捷運 API 帳密（Render 的 Environment 裡要設定）
 const MRT_USER = process.env.MRT_USER;
 const MRT_PASS = process.env.MRT_PASS;
 
-// 可選：想額外追蹤的車號（給 GetTrainInfo 用，不給也可以）
-const CAR_ID_LIST = (process.env.CAR_ID_LIST || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// ---- 官方網址 & SOAPAction ----
+// ---- 官方網址 ----
+// 列車位置（文湖線 / 板南線）
 const TRAININFO_ENDPOINT =
   'https://mobileapp.metro.taipei/TRTCTraininfo/TrainTimeControl.asmx';
-const TRAININFO_SOAP_ACTION = 'http://tempuri.org/GetTrainInfo';
 
+// 高運量車廂擁擠度
 const CARWEIGHT_ENDPOINT =
   'https://api.metro.taipei/metroapi/CarWeight.asmx';
-const CARWEIGHTEX_SOAP_ACTION = 'http://tempuri.org/getCarWeightByInfoEx';
 
+// 列車到站資訊
 const TRACKINFO_ENDPOINT =
   'https://api.metro.taipei/metroapi/TrackInfo.asmx';
-const TRACKINFO_SOAP_ACTION = 'http://tempuri.org/getTrackInfo';
 
+// 啟動時印一下設定
 console.log('========================================');
-console.log('🚆 MRT server starting...');
+console.log('🚆 MRT proxy starting...');
 console.log('PORT =', PORT);
 console.log('MRT_USER set:', !!MRT_USER);
 console.log('MRT_PASS set:', !!MRT_PASS);
-console.log('CAR_ID_LIST =', CAR_ID_LIST);
 console.log('========================================');
 
 const xmlParser = new xml2js.Parser({
@@ -47,26 +43,35 @@ const xmlParser = new xml2js.Parser({
   tagNameProcessors: [xml2js.processors.stripPrefix],
 });
 
-// 判斷字串是不是 JSON
+// 判斷字串是不是 JSON（有些 API 會在 XML 前面塞 JSON）
 function looksLikeJson(str) {
   if (typeof str !== 'string') return false;
   const s = str.trim();
-  return (s.startsWith('{') && s.endsWith('}')) ||
-         (s.startsWith('[') && s.endsWith(']'));
+  return (
+    (s.startsWith('{') && s.endsWith('}')) ||
+    (s.startsWith('[') && s.endsWith(']'))
+  );
 }
 
-// 解析 TRTC 回傳（前面可能有 JSON，後面是 SOAP XML）
+// 共用：解析 TRTC 回傳（前面可能有 JSON，後面是 SOAP XML）
 async function parseSoapResponse(rawData, responseNameHint) {
   const bodyStr = typeof rawData === 'string' ? rawData : String(rawData);
 
-  // 如果是 HTML，大概是被擋或導錯頁
-  if (bodyStr.trim().startsWith('<!DOCTYPE html') || bodyStr.includes('<html')) {
-    console.error('❌ HTML returned instead of SOAP/XML. First 200 chars:');
+  // 被擋或導錯頁時常會回 HTML
+  if (
+    bodyStr.trim().startsWith('<!DOCTYPE html') ||
+    bodyStr.includes('<html')
+  ) {
+    console.error(
+      '❌ HTML returned instead of SOAP/XML. First 200 chars:'
+    );
     console.error(bodyStr.slice(0, 200));
-    throw new Error('TRTC API returned HTML (maybe IP restricted or bad credentials)');
+    throw new Error(
+      'TRTC API returned HTML (maybe IP restricted or bad credentials)'
+    );
   }
 
-  // 嘗試抓「前面那段 JSON」
+  // 嘗試抓前面的 JSON（如果有）
   let jsonPart = null;
   const jsonStart = bodyStr.indexOf('{');
   const jsonEnd = bodyStr.indexOf('}</');
@@ -104,6 +109,7 @@ async function parseSoapResponse(rawData, responseNameHint) {
 
   let soapNode = body;
 
+  // 盡量往 *xxxResponse* 那個節點抓
   if (responseNameHint) {
     const hintLower = responseNameHint.toLowerCase();
     const key = Object.keys(body).find((k) =>
@@ -119,13 +125,17 @@ async function parseSoapResponse(rawData, responseNameHint) {
   };
 }
 
-// ---- 呼叫各個 API ----
+/* =======================
+ *  呼叫各個 TRTC API
+ * ======================= */
 
-// 列車位置（用 carID）
+// 1. 列車位置（GetTrainInfo，給 /api/train/:carId 用）
+//    這支「一定有成功」的紀錄，所以保留 SOAPAction
 async function callGetTrainInfo(carId) {
   if (!MRT_USER || !MRT_PASS) {
     throw new Error('MRT_USER / MRT_PASS not set');
   }
+
   const soapBody = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
@@ -142,7 +152,7 @@ async function callGetTrainInfo(carId) {
   const res = await axios.post(TRAININFO_ENDPOINT, soapBody, {
     headers: {
       'Content-Type': 'text/xml; charset=utf-8',
-      SOAPAction: TRAININFO_SOAP_ACTION,
+      SOAPAction: 'http://tempuri.org/GetTrainInfo',
     },
     timeout: 10000,
   });
@@ -150,7 +160,8 @@ async function callGetTrainInfo(carId) {
   return parseSoapResponse(res.data, 'GetTrainInfoResponse');
 }
 
-// 高運量車廂擁擠度
+// 2. 高運量車廂擁擠度（getCarWeightByInfoEx）
+//    這支照官方文件，只送 Content-Type，不送 SOAPAction
 async function callCarWeightEx() {
   if (!MRT_USER || !MRT_PASS) {
     throw new Error('MRT_USER / MRT_PASS not set');
@@ -171,7 +182,6 @@ async function callCarWeightEx() {
   const res = await axios.post(CARWEIGHT_ENDPOINT, soapBody, {
     headers: {
       'Content-Type': 'text/xml; charset=utf-8',
-      SOAPAction: CARWEIGHTEX_SOAP_ACTION,
     },
     timeout: 10000,
   });
@@ -179,7 +189,7 @@ async function callCarWeightEx() {
   return parseSoapResponse(res.data, 'getCarWeightByInfoExResponse');
 }
 
-// 列車到站資訊
+// 3. 列車到站資訊（getTrackInfo）
 async function callTrackInfo() {
   if (!MRT_USER || !MRT_PASS) {
     throw new Error('MRT_USER / MRT_PASS not set');
@@ -200,7 +210,6 @@ async function callTrackInfo() {
   const res = await axios.post(TRACKINFO_ENDPOINT, soapBody, {
     headers: {
       'Content-Type': 'text/xml; charset=utf-8',
-      SOAPAction: TRACKINFO_SOAP_ACTION,
     },
     timeout: 10000,
   });
@@ -208,9 +217,11 @@ async function callTrackInfo() {
   return parseSoapResponse(res.data, 'getTrackInfoResponse');
 }
 
-// ---- 把 SOAP 統一整理成 array ----
+/* =======================
+ *  把 SOAP 轉成陣列
+ * ======================= */
 
-function extractTrackItems(soap) {
+function extractItemsFromSoap(soap) {
   if (!soap) return [];
 
   if (looksLikeJson(soap)) {
@@ -243,36 +254,7 @@ function extractTrackItems(soap) {
   return [];
 }
 
-function extractCarWeightItems(soap) {
-  if (!soap) return [];
-  if (looksLikeJson(soap)) {
-    try {
-      const parsed = JSON.parse(soap);
-      return Array.isArray(parsed) ? parsed : [parsed];
-    } catch {
-      return [];
-    }
-  }
-  if (typeof soap === 'object') {
-    if (Array.isArray(soap)) return soap;
-    for (const k of Object.keys(soap)) {
-      const v = soap[k];
-      if (!v) continue;
-      if (Array.isArray(v)) return v;
-      if (typeof v === 'string' && looksLikeJson(v)) {
-        try {
-          const parsed = JSON.parse(v);
-          return Array.isArray(parsed) ? parsed : [parsed];
-        } catch {
-          continue;
-        }
-      }
-    }
-  }
-  return [];
-}
-
-// 判斷一筆到站資訊是不是指定車站
+// 判斷到站資料是否屬於指定車站
 function matchStation(item, stationId) {
   if (!item || !stationId) return false;
   const sid = stationId.toString().toUpperCase();
@@ -294,7 +276,7 @@ function matchStation(item, stationId) {
   });
 }
 
-// 把擁擠度資料對應到指定列車
+// 判斷擁擠度資料是否屬於指定列車
 function matchTrainForCrowd(item, trainId) {
   if (!item || !trainId) return false;
   const tid = String(trainId).toUpperCase();
@@ -306,12 +288,13 @@ function matchTrainForCrowd(item, trainId) {
   });
 }
 
-// ---- 全域快取 ----
+/* =======================
+ *  全域快取
+ * ======================= */
 
 let globalCache = {
   success: false,
   lastUpdate: null,
-  trains: [],
   trackInfo: null,
   trackItems: [],
   carWeight: null,
@@ -324,7 +307,6 @@ async function refreshAll() {
     globalCache = {
       success: false,
       lastUpdate: new Date().toISOString(),
-      trains: [],
       trackInfo: null,
       trackItems: [],
       carWeight: null,
@@ -343,37 +325,19 @@ async function refreshAll() {
       callCarWeightEx().catch((e) => ({ error: e.message })),
     ]);
 
-    const trains = [];
-    for (const carId of CAR_ID_LIST) {
-      try {
-        const info = await callGetTrainInfo(carId);
-        trains.push({
-          carId,
-          error: null,
-          apiTrainInfoJson: info.json || null,
-          apiTrainInfoSoap: info.soap || null,
-        });
-      } catch (e) {
-        console.error(`❌ GetTrainInfo failed for carId=${carId}:`, e.message);
-        trains.push({
-          carId,
-          error: e.message,
-          apiTrainInfoJson: null,
-          apiTrainInfoSoap: null,
-        });
-      }
-    }
-
     globalCache = {
       success: true,
       lastUpdate: new Date().toISOString(),
-      trains,
       trackInfo: trackRes && !trackRes.error ? trackRes.soap : null,
       trackItems:
-        trackRes && !trackRes.error ? extractTrackItems(trackRes.soap) : [],
+        trackRes && !trackRes.error
+          ? extractItemsFromSoap(trackRes.soap)
+          : [],
       carWeight: weightRes && !weightRes.error ? weightRes.soap : null,
       carWeightItems:
-        weightRes && !weightRes.error ? extractCarWeightItems(weightRes.soap) : [],
+        weightRes && !weightRes.error
+          ? extractItemsFromSoap(weightRes.soap)
+          : [],
       message: null,
     };
 
@@ -390,7 +354,6 @@ async function refreshAll() {
     globalCache = {
       success: false,
       lastUpdate: new Date().toISOString(),
-      trains: [],
       trackInfo: null,
       trackItems: [],
       carWeight: null,
@@ -404,15 +367,18 @@ async function refreshAll() {
 refreshAll();
 setInterval(refreshAll, 30000);
 
-// ---- 路由 ----
+/* =======================
+ *  路由
+ * ======================= */
 
+// 簡單健康檢查
 app.get('/', (req, res) => {
   res.send(
-    `MRT proxy running. lastUpdate=${globalCache.lastUpdate} items=${globalCache.trackItems.length}`
+    `MRT proxy running. lastUpdate=${globalCache.lastUpdate}, trackItems=${globalCache.trackItems.length}`
   );
 });
 
-// 原始到站資訊（debug 用，方便看欄位）
+// 原始到站資訊（debug 用）
 app.get('/api/raw/track-info', (req, res) => {
   res.json({
     success: !!globalCache.trackInfo,
@@ -432,7 +398,7 @@ app.get('/api/raw/car-weight', (req, res) => {
   });
 });
 
-// 以「車站」為主的 API：/api/station/BL12
+// 以「車站」為主：/api/station/BL12
 app.get('/api/station/:stationId', (req, res) => {
   const stationId = req.params.stationId;
   const allItems = globalCache.trackItems || [];
@@ -441,7 +407,13 @@ app.get('/api/station/:stationId', (req, res) => {
   const crowdItems = globalCache.carWeightItems || [];
 
   const enriched = byStation.map((it) => {
-    const candidateTrainKeys = ['TrainID', 'TrainId', 'TrainNo', 'CarID', 'CarId'];
+    const candidateTrainKeys = [
+      'TrainID',
+      'TrainId',
+      'TrainNo',
+      'CarID',
+      'CarId',
+    ];
     let trainId = null;
     for (const k of candidateTrainKeys) {
       if (it[k]) {
@@ -452,14 +424,16 @@ app.get('/api/station/:stationId', (req, res) => {
 
     let crowd = null;
     if (trainId) {
-      crowd = crowdItems.filter((cw) => matchTrainForCrowd(cw, trainId));
+      crowd = crowdItems.filter((cw) =>
+        matchTrainForCrowd(cw, trainId)
+      );
     }
 
     return {
       stationId,
-      raw: it,       // 原始一筆到站資料（裡面會有倒數、目的地等欄位）
+      raw: it, // 原始到站資料（裡面會有倒數、目的地等欄位）
       trainId,
-      crowd,         // 這班車對到的擁擠度資料（可能多筆，代表不同車廂）
+      crowd, // 這班車對到的擁擠度資料（可能多筆，代表不同車廂）
     };
   });
 
@@ -470,11 +444,11 @@ app.get('/api/station/:stationId', (req, res) => {
     count: enriched.length,
     trains: enriched,
     note:
-      '欄位名稱是先用猜的（SID, StationID, TrainID 等），你可以先看 /api/raw/track-info /api/raw/car-weight 回傳的欄位，再改 matchStation / matchTrainForCrowd 讓結果更準。',
+      '欄位名稱目前先用猜的（SID, StationID, TrainID 等），請先看 /api/raw/track-info /api/raw/car-weight 的欄位，再視需要調整 matchStation / matchTrainForCrowd。',
   });
 });
 
-// 直接查單一車號的位置（如果你之後要用，可選）
+// 單次查某一個車號的位置（如果你前端要用）
 app.get('/api/train/:carId', async (req, res) => {
   const carId = req.params.carId;
   try {
@@ -492,18 +466,6 @@ app.get('/api/train/:carId', async (req, res) => {
       message: e.message,
     });
   }
-});
-
-// 回傳目前快取到的車號資料（如果有設定 CAR_ID_LIST 才會有）
-app.get('/api/trains', (req, res) => {
-  res.json({
-    success: globalCache.success,
-    lastUpdate: globalCache.lastUpdate,
-    carIds: CAR_ID_LIST,
-    trains: globalCache.trains,
-    trackItemsCount: globalCache.trackItems.length,
-    carWeightItemsCount: globalCache.carWeightItems.length,
-  });
 });
 
 app.listen(PORT, () => {
