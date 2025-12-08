@@ -78,22 +78,35 @@ function extractJsonArrayFromSoap(raw, tagName) {
 
   const jsonSlice = raw.slice(start, end + 1);
 
-  try {
-    const parsed = JSON.parse(jsonSlice);
-
-    // 有些時候會是字串包一層，再 parse 一次
+  // helper: 把 parse 結果統一轉成陣列
+  const normalizeParsed = (parsed) => {
     if (typeof parsed === 'string') {
+      // 如果是字串，再 parse 一次
       return JSON.parse(parsed);
     }
     if (Array.isArray(parsed)) {
       return parsed;
     }
+    // 其他型別就當作沒有資料
+    return [];
+  };
 
-    console.error(`❌ ${tagName} JSON 不是陣列，類型為:`, typeof parsed);
-    return [];
-  } catch (e) {
-    console.error(`❌ ${tagName} 解析 JSON 失敗:`, e.message, '片段=', jsonSlice.slice(0, 200));
-    return [];
+  // 第一輪：直接 parse
+  try {
+    const parsed = JSON.parse(jsonSlice);
+    return normalizeParsed(parsed);
+  } catch (e1) {
+    // 第二輪：把 \" 還原成 " 再試一次（CarWeight 會是這種格式）
+    try {
+      const unescaped = jsonSlice
+        .replace(/\\"/g, '"')   // 把 \" 變回 "
+        .replace(/\\\\/g, '\\'); // 把 \\ 變回 \
+      const parsed2 = JSON.parse(unescaped);
+      return normalizeParsed(parsed2);
+    } catch (e2) {
+      console.error(`❌ ${tagName} 解析 JSON 失敗 (兩次皆失敗):`, e2.message, '片段=', jsonSlice.slice(0, 200));
+      return [];
+    }
   }
 }
 
