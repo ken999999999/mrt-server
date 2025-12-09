@@ -86,7 +86,6 @@ function extractJsonArrayFromSoap(raw, tagName) {
 
   if (start === -1 || end === -1 || end <= start) {
     // 有時候回傳空陣列或者是沒資料，這裡不一定是錯，但如果是 HTML 格式就會在上面被擋掉
-    // console.error(`❌ ${tagName} 找不到 JSON 陣列 [ ... ]`); 
     return [];
   }
 
@@ -160,16 +159,19 @@ async function fetchCarWeightAll() {
 }
 
 // 將 TrackInfo + CarWeight 合併（用 TrainNumber 當 key）
+// 這個是給 /api/trains 用的總表，跟 /api/station 的邏輯獨立
 function mergeTrackAndWeight(trackList, weightList) {
+  const normalizeTrainNo = (v) => (v != null ? String(v).trim() : "");
+
   const weightByTrain = new Map();
   (weightList || []).forEach(row => {
-    const num = row.TrainNumber != null ? String(row.TrainNumber).trim() : '';
+    const num = normalizeTrainNo(row.TrainNumber);
     if (!num) return;
     weightByTrain.set(num, row);
   });
 
   return (trackList || []).map(row => {
-    const num = row.TrainNumber != null ? String(row.TrainNumber).trim() : '';
+    const num = normalizeTrainNo(row.TrainNumber);
     const w = weightByTrain.get(num) || null;
     return {
       trainNumber: num,
@@ -232,73 +234,94 @@ const stationIdToName = {
   Y19: "幸福", Y20: "新北產業園區"
 };
 
-// ====== 修改後的 trainsByStationId (優先查詢 TrackInfo) ======
+// ====== 依站碼取得該站的列車（優先使用 TrackInfo，避免用到別站的倒數） ======
 function trainsByStationId(stationId, trackList, weightList) {
-  const sid = stationId.toUpperCase();
-  const sName = stationIdToName[sid]; // 取得中文站名，例如 "忠孝新生"
+  const sid = (stationId || "").toUpperCase();
+  const sName = stationIdToName[sid] || null; // 例如 BL10 -> "龍山寺"
 
-  // 1. 先找出所有在這個車站的列車 (從 TrackInfo 找，因為這裡有倒數時間)
-  let targetTrains = [];
-  if (sName) {
-    targetTrains = (trackList || []).filter(t => t.StationName === sName);
-  }
+  const normalizeTrainNo = (v) => (v != null ? String(v).trim() : "");
 
-  // 2. 找出該站的擁擠度資料 (作為備用或合併用)
-  const stationWeightData = (weightList || []).filter(w => w.StationID === sid);
+  // 判斷 TrackInfo.StationName 是否屬於這個站（處理有沒有「站」字的問題）
+  const stationNameMatches = (trackStationName, baseName) => {
+    if (!trackStationName || !baseName) return false;
+    const name = String(trackStationName).trim();
+    const base = String(baseName).trim();
+    return name === base || name === `${base}站`;
+  };
 
-  // 3. 建立一個 Map 方便快速查找擁擠度 (Key: TrainNumber)
-  const weightMap = new Map();
-  stationWeightData.forEach(w => {
-    const num = w.TrainNumber != null ? String(w.TrainNumber).trim() : '';
-    if (num) weightMap.set(num, w);
+  // 1) 先找出「TrackInfo 顯示在這一站」的列車（這些才有可靠倒數）
+  const trackAtThisStation = (trackList || []).filter((row) =>
+    stationNameMatches(row.StationName, sName)
+  );
+
+  // 2) 再找出「CarWeight 在這一站的擁擠度資料」
+  const stationWeightData = (weightList || []).filter(
+    (w) => w.StationID === sid
+  );
+
+  // 3) 建一個 map，方便依 TrainNumber 找擁擠度
+  const weightByTrain = new Map();
+  stationWeightData.forEach((w) => {
+    const num = normalizeTrainNo(w.TrainNumber);
+    if (num) weightByTrain.set(num, w);
   });
 
-  // 4. 合併資料
-  // 情況 A: TrackInfo 有資料的列車 (這是主要的)
-  const mergedResults = targetTrains.map(track => {
-    const num = track.TrainNumber != null ? String(track.TrainNumber).trim() : '';
-    
-    // 嘗試從該站的擁擠度資料找
-    let w = weightMap.get(num);
-    
-    // 如果該站沒擁擠度，嘗試從全域擁擠度找 (有時候車子剛離站，擁擠度還在但站點判定稍微不同)
+  const merged = [];
+
+  // ===== 情況 A：TrackInfo 有顯示在這一站（有倒數） =====
+  trackAtThisStation.forEach((track) => {
+    const num = normalizeTrainNo(track.TrainNumber);
+    if (!num) return;
+
+    // 先用「這一站的擁擠度」，沒有就退而求其次用同一班車的其它擁擠度
+    let w = weightByTrain.get(num);
     if (!w) {
-       w = (weightList || []).find(row => String(row.TrainNumber).trim() === num);
+      w =
+        (weightList || []).find(
+          (row) => normalizeTrainNo(row.TrainNumber) === num
+        ) || null;
     }
 
-    return {
+    merged.push({
       trainNumber: num,
       stationId: sid,
-      stationName: track.StationName,
-      destinationName: track.DestinationName,
-      countDown: track.CountDown,
-      nowDateTime: track.NowDateTime,
+      stationName: track.StationName || sName,
+      destinationName: track.DestinationName || null,
+      countDown: track.CountDown || null, // ✅ 這裡的倒數是「這一站」的
+      nowDateTime: track.NowDateTime || null,
       rawTrack: track,
-      rawCrowd: w || null
-    };
+      rawCrowd: w,
+    });
   });
 
-  // 情況 B: 只有擁擠度資料，但 TrackInfo 沒資料的列車 (補漏)
-  stationWeightData.forEach(w => {
-    const num = w.TrainNumber != null ? String(w.TrainNumber).trim() : '';
-    // 如果這班車還不在結果清單中，就加進去
-    const exists = mergedResults.find(r => r.trainNumber === num);
-    if (!exists) {
-        const t = (trackList || []).find(row => String(row.TrainNumber).trim() === num);
-        mergedResults.push({
-            trainNumber: num,
-            stationId: sid,
-            stationName: sName || w.StationName,
-            destinationName: t?.DestinationName || null,
-            countDown: t?.CountDown || null,
-            nowDateTime: t?.NowDateTime || null,
-            rawTrack: t || null,
-            rawCrowd: w
-        });
-    }
+  // ===== 情況 B：只有擁擠度，這一站沒有 TrackInfo（不要亂借別站倒數） =====
+  stationWeightData.forEach((w) => {
+    const num = normalizeTrainNo(w.TrainNumber);
+    if (!num) return;
+
+    // 如果這班車在情況 A 已經加進去了，就不要重複
+    if (merged.some((r) => r.trainNumber === num)) return;
+
+    // 可以抓一筆任意 TrackInfo 來補「終點站名稱」等資訊（但不用它的倒數）
+    const tAny =
+      (trackList || []).find(
+        (row) => normalizeTrainNo(row.TrainNumber) === num
+      ) || null;
+
+    merged.push({
+      trainNumber: num,
+      stationId: sid,
+      stationName: sName || w.StationName || tAny?.StationName || null,
+      destinationName: tAny?.DestinationName || null,
+      // ⭐ 刻意不給 countDown / nowDateTime，避免把別站倒數當成本站
+      countDown: null,
+      nowDateTime: null,
+      rawTrack: tAny,
+      rawCrowd: w,
+    });
   });
 
-  return mergedResults;
+  return merged;
 }
 
 // ====== 定期更新快取 ======
@@ -385,7 +408,7 @@ app.get('/api/station/:stationId', (req, res) => {
     lastUpdate: cache.lastUpdate,
     count: trains.length,
     trains,
-    note: '已修正為優先查詢 TrackInfo，即使沒有擁擠度也會顯示列車',
+    note: '已修正為優先查詢 TrackInfo，僅在該站有 TrackInfo 時才提供倒數，其餘僅顯示擁擠度',
   });
 });
 
