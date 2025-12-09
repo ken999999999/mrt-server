@@ -1,4 +1,4 @@
-// server.js - Taipei Metro TrackInfo + CarWeight backend (TrackInfo + CarWeightEx + CarWeightBR)
+// server.js - TRTC Backend (TrackInfo + CarWeight Only)
 
 require('dotenv').config();
 const express = require('express');
@@ -10,323 +10,230 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 
-// 在 Render / 本機 .env 設定：MRT_USER / MRT_PASS
 const MRT_USER = process.env.MRT_USER;
 const MRT_PASS = process.env.MRT_PASS;
 
 if (!MRT_USER || !MRT_PASS) {
-  console.warn('⚠️ MRT_USER / MRT_PASS 尚未設定，請在環境變數中設定捷運提供的帳號密碼。');
+  console.warn('⚠️ MRT_USER / MRT_PASS 尚未設定，請在環境變數中設定。');
 }
 
-// TRTC endpoints
+// Endpoints
 const TRACK_INFO_URL = 'https://api.metro.taipei/metroapi/TrackInfo.asmx';
-const CAR_WEIGHT_EX_URL = 'https://api.metro.taipei/metroapi/CarWeight.asmx';     // getCarWeightByInfoEx（全部高運量線，不含文湖）
-const CAR_WEIGHT_BR_URL = 'https://api.metro.taipei/metroapi/CarWeightBR.asmx';   // getCarWeightBRInfo（文湖線）
+const CAR_WEIGHT_EX_URL = 'https://api.metro.taipei/metroapi/CarWeight.asmx';
+const CAR_WEIGHT_BR_URL = 'https://api.metro.taipei/metroapi/CarWeightBR.asmx';
 
-// 簡單的全域快取
+// ====== 完整車站對照表 (ID -> Name) ======
+const stationMap = {
+  // 文湖線
+  'BR01': '動物園', 'BR02': '木柵', 'BR03': '萬芳社區', 'BR04': '萬芳醫院',
+  'BR05': '辛亥', 'BR06': '麟光', 'BR07': '六張犁', 'BR08': '科技大樓',
+  'BR09': '大安', 'BR10': '忠孝復興', 'BR11': '南京復興', 'BR12': '中山國中',
+  'BR13': '松山機場', 'BR14': '大直', 'BR15': '劍南路', 'BR16': '西湖',
+  'BR17': '港墘', 'BR18': '文德', 'BR19': '內湖', 'BR20': '大湖公園',
+  'BR21': '葫洲', 'BR22': '東湖', 'BR23': '南港軟體園區', 'BR24': '南港展覽館',
+  // 淡水信義線
+  'R02': '象山', 'R03': '台北101/世貿', 'R04': '信義安和', 'R05': '大安',
+  'R06': '大安森林公園', 'R07': '東門', 'R08': '中正紀念堂', 'R09': '台大醫院',
+  'R10': '台北車站', 'R11': '中山', 'R12': '雙連', 'R13': '民權西路',
+  'R14': '圓山', 'R15': '劍潭', 'R16': '士林', 'R17': '芝山',
+  'R18': '明德', 'R19': '石牌', 'R20': '唭哩岸', 'R21': '奇岩',
+  'R22': '北投', 'R22A': '新北投', 'R23': '復興崗', 'R24': '忠義',
+  'R25': '關渡', 'R26': '竹圍', 'R27': '紅樹林', 'R28': '淡水',
+  // 松山新店線
+  'G01': '新店', 'G02': '新店區公所', 'G03': '七張', 'G03A': '小碧潭',
+  'G04': '大坪林', 'G05': '景美', 'G06': '萬隆', 'G07': '公館',
+  'G08': '台電大樓', 'G09': '古亭', 'G10': '中正紀念堂', 'G11': '小南門',
+  'G12': '西門', 'G13': '北門', 'G14': '中山', 'G15': '松江南京',
+  'G16': '南京復興', 'G17': '台北小巨蛋', 'G18': '南京三民', 'G19': '松山',
+  // 中和新蘆線
+  'O01': '南勢角', 'O02': '景安', 'O03': '永安市場', 'O04': '頂溪',
+  'O05': '古亭', 'O06': '東門', 'O07': '忠孝新生', 'O08': '松江南京',
+  'O09': '行天宮', 'O10': '中山國小', 'O11': '民權西路', 'O12': '大橋頭',
+  'O13': '台北橋', 'O14': '菜寮', 'O15': '三重', 'O16': '先嗇宮',
+  'O17': '頭前庄', 'O18': '新莊', 'O19': '輔大', 'O20': '丹鳳', 'O21': '迴龍',
+  'O50': '三重國小', 'O51': '三和國中', 'O52': '徐匯中學', 'O53': '三民高中', 'O54': '蘆洲',
+  // 板南線
+  'BL01': '頂埔', 'BL02': '永寧', 'BL03': '土城', 'BL04': '海山',
+  'BL05': '亞東醫院', 'BL06': '府中', 'BL07': '板橋', 'BL08': '新埔',
+  'BL09': '江子翠', 'BL10': '龍山寺', 'BL11': '西門', 'BL12': '台北車站',
+  'BL13': '善導寺', 'BL14': '忠孝新生', 'BL15': '忠孝復興', 'BL16': '忠孝敦化',
+  'BL17': '國父紀念館', 'BL18': '市政府', 'BL19': '永春', 'BL20': '後山埤',
+  'BL21': '昆陽', 'BL22': '南港', 'BL23': '南港展覽館',
+  // 環狀線
+  'Y07': '大坪林', 'Y08': '十四張', 'Y09': '秀朗橋', 'Y10': '景平',
+  'Y11': '景安', 'Y12': '中和', 'Y13': '橋和', 'Y14': '中原',
+  'Y15': '板新', 'Y16': '板橋', 'Y17': '新埔民生', 'Y18': '頭前庄',
+  'Y19': '幸福', 'Y20': '新北產業園區'
+};
+
 const cache = {
   lastUpdate: null,
   trackInfo: [],
-  carWeight: [],  // Ex + BR 合併後的全部擁擠度
-  merged: [],
+  carWeight: [],
   ok: false,
 };
 
-// ====== SOAP body（依照你 Postman 成功的格式） ======
-function buildTrackInfoSoap() {
+// ====== SOAP Builders ======
+function buildSoap(methodName, bodyContent) {
+  // 使用 SOAP 1.2 格式
   return `<?xml version="1.0" encoding="utf-8"?>
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
   <soap12:Body>
-    <getTrackInfo xmlns="http://tempuri.org/">
-      <userName>${MRT_USER}</userName>
-      <passWord>${MRT_PASS}</passWord>
-    </getTrackInfo>
+    <${methodName} xmlns="http://tempuri.org/">
+      ${bodyContent}
+    </${methodName}>
   </soap12:Body>
 </soap12:Envelope>`;
 }
 
-// 高運量（板南、淡水信義、中和新蘆、松山新店…）擁擠度
-function buildCarWeightExSoap() {
-  return `<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <getCarWeightByInfoEx xmlns="http://tempuri.org/">
-      <userName>${MRT_USER}</userName>
-      <passWord>${MRT_PASS}</passWord>
-    </getCarWeightByInfoEx>
-  </soap12:Body>
-</soap12:Envelope>`;
-}
-
-// 文湖線擁擠度
-function buildCarWeightBRSoap() {
-  return `<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <getCarWeightBRInfo xmlns="http://tempuri.org/">
-      <userName>${MRT_USER}</userName>
-      <passWord>${MRT_PASS}</passWord>
-    </getCarWeightBRInfo>
-  </soap12:Body>
-</soap12:Envelope>`;
-}
-
-// ====== 共用：從 SOAP 字串裡抓 JSON 陣列 ======
+// ====== Helpers ======
 function extractJsonArrayFromSoap(raw, tagName) {
-  if (typeof raw !== 'string') {
-    raw = String(raw);
-  }
-
-  // 粗略檢查有沒有錯誤頁
-  if (raw.includes('<title>請洽系統管理員') || raw.includes('<html')) {
-    console.error(`❌ ${tagName} 收到 HTML 錯誤頁，無法解析 JSON。`);
-    return [];
-  }
-
+  if (typeof raw !== 'string') raw = String(raw);
+  if (raw.includes('<title>請洽系統管理員') || raw.includes('<html')) return [];
   const start = raw.indexOf('[');
   const end = raw.lastIndexOf(']');
-
-  if (start === -1 || end === -1 || end <= start) {
-    console.error(`❌ ${tagName} 找不到 JSON 陣列 [ ... ]，raw 前 200 字：`, raw.slice(0, 200));
-    return [];
-  }
-
+  if (start === -1 || end === -1 || end <= start) return [];
+  
   const jsonSlice = raw.slice(start, end + 1);
-
-  // helper: 把 parse 結果統一轉成陣列
-  const normalizeParsed = (parsed) => {
-    if (typeof parsed === 'string') {
-      // 如果是字串，再 parse 一次
-      return JSON.parse(parsed);
-    }
-    if (Array.isArray(parsed)) {
-      return parsed;
-    }
-    // 其他型別就當作沒有資料
-    return [];
-  };
-
-  // 第一輪：直接 parse
   try {
-    const parsed = JSON.parse(jsonSlice);
-    return normalizeParsed(parsed);
-  } catch (e1) {
-    // 第二輪：把 \" 還原成 " 再試一次（某些 API 會是這種格式）
+    return JSON.parse(jsonSlice);
+  } catch (e) {
     try {
-      const unescaped = jsonSlice
-        .replace(/\\"/g, '"')   // 把 \" 變回 "
-        .replace(/\\\\/g, '\\'); // 把 \\ 變回 \
-      const parsed2 = JSON.parse(unescaped);
-      return normalizeParsed(parsed2);
+      const unescaped = jsonSlice.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+      return JSON.parse(unescaped);
     } catch (e2) {
-      console.error(`❌ ${tagName} 解析 JSON 失敗 (兩次皆失敗):`, e2.message, '片段=', jsonSlice.slice(0, 200));
       return [];
     }
   }
 }
 
-// ====== 呼叫 TRTC 3 支 API ======
+// ====== API Calls ======
 async function fetchTrackInfo() {
-  const soapBody = buildTrackInfoSoap();
-  const res = await axios.post(TRACK_INFO_URL, soapBody, {
-    headers: { 'Content-Type': 'text/xml; charset=utf-8' },
-    timeout: 10000,
+  const body = `<userName>${MRT_USER}</userName><passWord>${MRT_PASS}</passWord>`;
+  const res = await axios.post(TRACK_INFO_URL, buildSoap('getTrackInfo', body), {
+    headers: { 'Content-Type': 'text/xml; charset=utf-8' }, timeout: 10000
   });
   return extractJsonArrayFromSoap(res.data, 'TrackInfo');
 }
 
-async function fetchCarWeightEx() {
-  const soapBody = buildCarWeightExSoap();
-  const res = await axios.post(CAR_WEIGHT_EX_URL, soapBody, {
-    headers: { 'Content-Type': 'text/xml; charset=utf-8' },
-    timeout: 10000,
-  });
-  return extractJsonArrayFromSoap(res.data, 'CarWeightEx');
-}
-
-async function fetchCarWeightBR() {
-  const soapBody = buildCarWeightBRSoap();
-  const res = await axios.post(CAR_WEIGHT_BR_URL, soapBody, {
-    headers: { 'Content-Type': 'text/xml; charset=utf-8' },
-    timeout: 10000,
-  });
-  return extractJsonArrayFromSoap(res.data, 'CarWeightBR');
-}
-
 async function fetchCarWeightAll() {
-  const [exList, brList] = await Promise.all([
-    fetchCarWeightEx(),
-    fetchCarWeightBR(),
+  const body = `<userName>${MRT_USER}</userName><passWord>${MRT_PASS}</passWord>`;
+  const [exRes, brRes] = await Promise.all([
+    axios.post(CAR_WEIGHT_EX_URL, buildSoap('getCarWeightByInfoEx', body), { headers: { 'Content-Type': 'text/xml; charset=utf-8' }, timeout: 10000 }),
+    axios.post(CAR_WEIGHT_BR_URL, buildSoap('getCarWeightBRInfo', body), { headers: { 'Content-Type': 'text/xml; charset=utf-8' }, timeout: 10000 })
   ]);
-
-  // 給每筆加上 lineType 方便除錯 / 未來 UI 用
-  exList.forEach(row => { row.lineType = 'HighCapacity'; }); // 高運量線（板南、淡水信義、松山新店、中和新蘆…）
-  brList.forEach(row => { row.lineType = 'Wenhu'; });        // 文湖線 BR
-
+  
+  const exList = extractJsonArrayFromSoap(exRes.data, 'CarWeightEx');
+  const brList = extractJsonArrayFromSoap(brRes.data, 'CarWeightBR');
+  
+  exList.forEach(row => { row.lineType = 'HighCapacity'; });
+  brList.forEach(row => { row.lineType = 'Wenhu'; });
+  
   return [...exList, ...brList];
 }
 
-// 將 TrackInfo + CarWeight 合併（用 TrainNumber 當 key）
-function mergeTrackAndWeight(trackList, weightList) {
-  const weightByTrain = new Map();
-  (weightList || []).forEach(row => {
-    const num = row.TrainNumber != null ? String(row.TrainNumber).trim() : '';
-    if (!num) return;
-    weightByTrain.set(num, row);
-  });
-
-  return (trackList || []).map(row => {
-    const num = row.TrainNumber != null ? String(row.TrainNumber).trim() : '';
-    const w = weightByTrain.get(num) || null;
-    return {
-      trainNumber: num,
-      stationName: row.StationName || null,
-      destinationName: row.DestinationName || null,
-      countDown: row.CountDown || null,
-      nowDateTime: row.NowDateTime || null,
-      rawTrack: row,
-      rawCrowd: w,
-    };
-  });
-}
-
-// 站碼對中文站名（先幫你放一個忠孝新生，之後可以自己擴充）
-const stationIdToName = {
-  BL12: '忠孝新生站',
-};
-
-// CarWeight 裡的 StationID 對 stationId
+// ====== Data Processing (Robust Merge) ======
 function trainsByStationId(stationId, trackList, weightList) {
   const sid = stationId.toUpperCase();
-  const weightRows = (weightList || []).filter(row => {
-    const rowId = row.StationID != null ? String(row.StationID).toUpperCase() : '';
-    return rowId === sid;
+  const sName = stationMap[sid]; 
+
+  const resultTrains = [];
+  const processedTrainNumbers = new Set();
+
+  // 1. CarWeight (擁擠度資料)
+  const weightMatches = (weightList || []).filter(row => {
+    return row.StationID && String(row.StationID).toUpperCase() === sid;
   });
 
-  const trackByTrain = new Map();
-  (trackList || []).forEach(row => {
-    const num = row.TrainNumber != null ? String(row.TrainNumber).trim() : '';
+  weightMatches.forEach(w => {
+    const num = w.TrainNumber ? String(w.TrainNumber).trim() : '';
     if (!num) return;
-    trackByTrain.set(num, row);
+
+    // 嘗試在 TrackInfo 找對應的資料
+    const t = (trackList || []).find(row => {
+        return row.TrainNumber && String(row.TrainNumber).trim() === num;
+    });
+
+    resultTrains.push({
+        trainNumber: num,
+        stationId: sid,
+        stationName: sName,
+        destinationName: t?.DestinationName || null,
+        countDown: t?.CountDown || null,
+        nowDateTime: t?.NowDateTime || null, 
+        rawTrack: t || null,
+        rawCrowd: w
+    });
+    processedTrainNumbers.add(num);
   });
 
-  return weightRows.map(row => {
-    const num = row.TrainNumber != null ? String(row.TrainNumber).trim() : '';
-    const t = trackByTrain.get(num) || null;
-    return {
-      trainNumber: num,
-      stationId: row.StationID || null,
-      stationName: row.StationName || null,
-      destinationName: t?.DestinationName || null,
-      countDown: t?.CountDown || null,
-      nowDateTime: t?.NowDateTime || null,
-      rawTrack: t,
-      rawCrowd: row,
-    };
-  });
-}
+  // 2. TrackInfo (到站顯示資料) - 補足沒有擁擠度資料的車
+  if (sName) {
+      const trackMatches = (trackList || []).filter(row => {
+          const rawName = row.StationName || '';
+          return rawName.includes(sName); 
+      });
 
-// ====== 定期更新快取 ======
-async function updateAll() {
-  if (!MRT_USER || !MRT_PASS) {
-    console.error('❌ MRT_USER / MRT_PASS 尚未設定，無法呼叫 TRTC API');
-    cache.ok = false;
-    return;
+      trackMatches.forEach(t => {
+          const num = t.TrainNumber ? String(t.TrainNumber).trim() : '';
+          if (num && processedTrainNumbers.has(num)) return;
+
+          resultTrains.push({
+              trainNumber: num || 'Unknown',
+              stationId: sid,
+              stationName: sName,
+              destinationName: t.DestinationName,
+              countDown: t.CountDown,
+              nowDateTime: t.NowDateTime,
+              rawTrack: t,
+              rawCrowd: null 
+          });
+      });
   }
 
+  return resultTrains;
+}
+
+async function updateAll() {
+  if (!MRT_USER || !MRT_PASS) return;
   try {
-    console.log('⏳ 正在更新 TrackInfo / CarWeightEx / CarWeightBR …');
-
-    const [trackList, weightAll] = await Promise.all([
-      fetchTrackInfo(),
-      fetchCarWeightAll(),
-    ]);
-
+    const [trackList, weightAll] = await Promise.all([fetchTrackInfo(), fetchCarWeightAll()]);
     cache.lastUpdate = new Date().toISOString();
     cache.trackInfo = trackList;
     cache.carWeight = weightAll;
-    cache.merged = mergeTrackAndWeight(trackList, weightAll);
     cache.ok = true;
-
-    console.log(
-      `✅ 更新完成：TrackInfo=${trackList.length} 筆, CarWeightAll=${weightAll.length} 筆, merged=${cache.merged.length} 筆`
-    );
+    console.log(`Update: Track=${trackList.length}, Weight=${weightAll.length}`);
   } catch (e) {
-    console.error('❌ 更新資料失敗:', e.message);
+    console.error('Update failed:', e.message);
     cache.ok = false;
   }
 }
 
-// 啟動時先更新一次，之後每 30 秒更新
+// Init
 updateAll();
 setInterval(updateAll, 30000);
 
 // ====== Routes ======
-app.get('/', (req, res) => {
-  res.json({
-    ok: cache.ok,
-    message: 'TRTC API proxy running',
-    lastUpdate: cache.lastUpdate,
-    counts: {
-      trackInfo: cache.trackInfo.length,
-      carWeight: cache.carWeight.length,
-      merged: cache.merged.length,
-    },
-  });
-});
 
-// 原始列車到站資訊
-app.get('/api/raw/track-info', (req, res) => {
-  res.json({
-    success: cache.ok,
-    lastUpdate: cache.lastUpdate,
-    count: cache.trackInfo.length,
-    items: cache.trackInfo,
-  });
-});
+app.get('/', (req, res) => res.json({ status: 'ok', lastUpdate: cache.lastUpdate }));
 
-// 原始擁擠度資料（高運量 + 文湖線）
-app.get('/api/raw/car-weight', (req, res) => {
-  res.json({
-    success: cache.ok,
-    lastUpdate: cache.lastUpdate,
-    count: cache.carWeight.length,
-    items: cache.carWeight,
-  });
-});
-
-// 查某一個站碼（例如 BL12：忠孝新生）
-app.get('/api/station/:stationId', (req, res) => {
-  const stationId = req.params.stationId.toUpperCase();
-  const stationName = stationIdToName[stationId] || stationId;
-
-  const trains = trainsByStationId(
-    stationId,
-    cache.trackInfo,
-    cache.carWeight
-  );
-
-  res.json({
-    success: cache.ok,
-    stationId,
-    stationName,
-    lastUpdate: cache.lastUpdate,
-    count: trains.length,
-    trains,
-    note: 'StationID 目前抓的是 CarWeight JSON 裡的 StationID 欄位。stationIdToName 只先填 BL12=忠孝新生站，之後可以自行擴充。',
-  });
-});
-
-// 所有列車（合併 TrackInfo + CarWeight）
 app.get('/api/trains', (req, res) => {
-  res.json({
-    success: cache.ok,
-    lastUpdate: cache.lastUpdate,
-    count: cache.merged.length,
-    data: cache.merged,
-  });
+    res.json({ success: cache.ok, data: cache.carWeight }); 
+});
+
+app.get('/api/station/:stationId', (req, res) => {
+    const stationId = req.params.stationId.toUpperCase();
+    const trains = trainsByStationId(stationId, cache.trackInfo, cache.carWeight);
+    
+    res.json({
+        success: cache.ok,
+        stationId,
+        lastUpdate: cache.lastUpdate,
+        count: trains.length,
+        trains: trains
+    });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
