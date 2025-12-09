@@ -1,4 +1,4 @@
-// server.js - TRTC Backend (TrackInfo + CarWeight Only)
+// server.js - 修復擁擠度消失問題 (加入文字正規化)
 
 require('dotenv').config();
 const express = require('express');
@@ -23,6 +23,7 @@ const CAR_WEIGHT_EX_URL = 'https://api.metro.taipei/metroapi/CarWeight.asmx';
 const CAR_WEIGHT_BR_URL = 'https://api.metro.taipei/metroapi/CarWeightBR.asmx';
 
 // ====== 完整車站對照表 (ID -> Name) ======
+// 這裡用「台」，但 API 可能回傳「臺」，下面程式碼會自動處理
 const stationMap = {
   // 文湖線
   'BR01': '動物園', 'BR02': '木柵', 'BR03': '萬芳社區', 'BR04': '萬芳醫院',
@@ -131,7 +132,7 @@ async function fetchCarWeightAll() {
   return [...exList, ...brList];
 }
 
-// ====== Data Processing (Fix for Missing Crowdedness) ======
+// ====== Data Processing (修復重點：加入 normalize) ======
 function trainsByStationId(stationId, trackList, weightList) {
   const sid = stationId.toUpperCase();
   const sName = stationMap[sid]; 
@@ -139,17 +140,27 @@ function trainsByStationId(stationId, trackList, weightList) {
   const resultTrains = [];
   const processedTrainNumbers = new Set();
 
+  // 🔥 小工具：統一轉成「台」，並去除空白
+  const normalize = (str) => (str || '').replace(/臺/g, '台').trim();
+  const normSName = normalize(sName);
+
   // 1. 處理 CarWeight (擁擠度資料)
   const weightMatches = (weightList || []).filter(row => {
     if (!row.StationID) return false;
-    const rowSid = String(row.StationID).toUpperCase();
-    return rowSid === sid || (sName && rowSid === sName);
+    
+    // API 回傳的 StationID 有可能是代號 (BR01) 也有可能是中文 (海山)
+    // 甚至可能是 "臺北車站"
+    const rowSid = normalize(String(row.StationID));
+    
+    // 比對：ID 相符 OR 中文站名相符
+    return rowSid.toUpperCase() === sid || (normSName && rowSid === normSName);
   });
 
   weightMatches.forEach(w => {
     const num = w.TrainNumber ? String(w.TrainNumber).trim() : '';
     if (!num) return;
 
+    // 嘗試在 TrackInfo 找對應的資料
     const t = (trackList || []).find(row => {
         return row.TrainNumber && String(row.TrainNumber).trim() === num;
     });
@@ -167,11 +178,12 @@ function trainsByStationId(stationId, trackList, weightList) {
     processedTrainNumbers.add(num);
   });
 
-  // 2. 處理 TrackInfo (到站顯示資料)
+  // 2. 處理 TrackInfo (補漏：沒擁擠度但有在跑馬燈的車)
   if (sName) {
       const trackMatches = (trackList || []).filter(row => {
-          const rawName = row.StationName || '';
-          return rawName.includes(sName); 
+          // TrackInfo 通常給中文，一樣要 normalize
+          const rawName = normalize(row.StationName);
+          return rawName.includes(normSName); 
       });
 
       trackMatches.forEach(t => {
