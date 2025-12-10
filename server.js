@@ -68,7 +68,15 @@ async function fetchApi(url, method) {
   }
 }
 
-// ... (前面的 code 不變)
+// ====== Helper: 正規化站名 (移除 BR、空白、換行、"站"字尾) ======
+function normalizeStation(name) {
+  if (!name) return "";
+  // 1. 轉字串 2. 移除 "BR" 前綴 3. 移除 "站" 字尾 4. 移除所有空白與換行(\n)
+  return String(name)
+    .replace(/^BR/i, '') 
+    .replace(/站$/, '')
+    .replace(/\s+/g, '');
+}
 
 async function updateAll() {
   if (!MRT_USER || !MRT_PASS) return;
@@ -77,44 +85,66 @@ async function updateAll() {
   const [trackList, wEx, wBr] = await Promise.all([
     fetchApi(TRACK_INFO_URL, 'getTrackInfo'),
     fetchApi(CAR_WEIGHT_EX_URL, 'getCarWeightByInfoEx'),
-    fetchApi(CAR_WEIGHT_BR_URL, 'getCarWeightBRInfo') // 文湖線資料
+    fetchApi(CAR_WEIGHT_BR_URL, 'getCarWeightBRInfo')
   ]);
 
-  // 除錯用：建議先印出來看看文湖線回傳什麼，確認欄位名稱
-  // if (wBr.length > 0) console.log('文湖線範例資料:', wBr[0]);
-
-  // 合併高運量與文湖線的擁擠度資料
-  const weightList = [...wEx, ...wBr];
-
-  // 建立 Map 加速查找 (Key: TrainNumber 或 TrainId)
-  const weightMap = new Map();
-  weightList.forEach(w => {
-    // 修改重點：同時檢查 TrainNumber (高運量) 和 TrainId (文湖線)
-    // 並且為了保險起見，將兩個來源的編號都轉成 String 並移除前後空白
-    const rawId = w.TrainNumber || w.TrainId; 
-    
-    if (rawId) {
-      // 移除可能的開頭 '0' (例如 TrackInfo 給 '010' 但車廂資料給 '10' 的情況)
-      // 雖然通常字串比對即可，但若遇到對不上的情況，可以考慮都轉成數字再轉字串： String(parseInt(rawId))
-      weightMap.set(String(rawId).trim(), w);
+  // 1. 建立高運量 (板南/淡水信義等) 的索引：使用 TrainNumber
+  const weightMapById = new Map();
+  wEx.forEach(w => {
+    if (w.TrainNumber) {
+      weightMapById.set(String(w.TrainNumber).trim(), w);
     }
   });
 
-  // 將擁擠度塞入列車位置資訊中 (以 TrackInfo 為主體)
+  // 2. 建立文湖線 (BR) 的索引：使用 "站名_方向"
+  // 根據 PDF 與捷運邏輯：
+  // 下行 (Down) -> 往 南港展覽館 (車站編號增加 BR01->BR24)
+  // 上行 (Up)   -> 往 動物園 (車站編號減少 BR24->BR01)
+  const wenhuMap = new Map(); 
+  
+  wBr.forEach(w => {
+    const rawName = w.StationName || "";
+    const cleanName = normalizeStation(rawName);
+    const du = w.DU || ""; // "上行" 或 "下行"
+
+    let dirKey = "";
+    if (du.includes("下")) dirKey = "ToNangang"; // 下行往南港
+    else if (du.includes("上")) dirKey = "ToZoo"; // 上行往動物園
+
+    if (cleanName && dirKey) {
+      // Key 範例: "大直_ToNangang"
+      wenhuMap.set(`${cleanName}_${dirKey}`, w);
+    }
+  });
+
+  // 3. 合併資料
   const mergedData = trackList.map(t => {
-    const tNum = String(t.TrainNumber).trim();
-    const wData = weightMap.get(tNum) || null;
-    
-    // 如果第一次沒對到，嘗試補零或去零的模糊比對 (針對文湖線常見的編號格式問題)
-    // 例如 TrackInfo 是 "11"，但擁擠度資料是 "011"
-    let finalWData = wData;
-    if (!finalWData) {
-        // 嘗試補 '0' (假設最多3位數)
-        const paddedNum = tNum.padStart(3, '0'); // "11" -> "011"
-        // 或是去 '0'
-        const strippedNum = String(parseInt(tNum, 10)); // "011" -> "11"
-        
-        finalWData = weightMap.get(paddedNum) || weightMap.get(strippedNum);
+    const tNum = String(t.TrainNumber || '').trim();
+    let wData = null;
+
+    // 判斷是否為文湖線 (透過目的地或路線ID判斷)
+    // 文湖線特徵：車號通常為空，且目的地是 動物園 或 南港展覽館
+    const isWenhu = t.LineId === 'BR' || 
+                    t.DestinationName.includes("動物園") || 
+                    (t.DestinationName.includes("南港展覽館") && !tNum); // 南港展覽館板南線也有，但板南線有車號
+
+    if (isWenhu) {
+      // --- 文湖線配對邏輯 ---
+      const cleanStation = normalizeStation(t.StationName);
+      let dirKey = "";
+      
+      // 將 TrackInfo 的 DestinationName 轉為我們自定義的 key
+      if (t.DestinationName.includes("南港")) dirKey = "ToNangang";
+      else if (t.DestinationName.includes("動物園")) dirKey = "ToZoo";
+
+      if (cleanStation && dirKey) {
+        wData = wenhuMap.get(`${cleanStation}_${dirKey}`);
+      }
+    } else {
+      // --- 高運量配對邏輯 (原本的) ---
+      if (tNum) {
+        wData = weightMapById.get(tNum);
+      }
     }
 
     return {
@@ -123,16 +153,18 @@ async function updateAll() {
       destinationName: t.DestinationName,
       countDown: t.CountDown,
       nowDateTime: t.NowDateTime,
-      rawCrowd: finalWData // 這裡放入找到的資料
+      // 統一回傳結構，如果 wData 存在，前端就能讀到 Car1~Car4
+      rawCrowd: wData 
     };
   });
 
   cache.merged = mergedData;
   cache.lastUpdate = new Date().toISOString();
   cache.ok = true;
-  console.log(`✅ 更新完成: ${mergedData.length} 筆列車資料 (含擁擠度匹配)`);
+  
+  const matchedCount = mergedData.filter(d => d.rawCrowd).length;
+  console.log(`✅ 更新完成: 總共 ${mergedData.length} 筆，含擁擠度資料: ${matchedCount} 筆`);
 }
-
 // ... (後面的 code 不變)
 // 每 15 秒更新一次 (捷運 API 反應沒那麼快，太快會被擋)
 setInterval(updateAll, 15000);
